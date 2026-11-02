@@ -1,0 +1,27 @@
+#!/bin/sh
+#
+# WARP 优选 up 后校验钩子（异步）
+# 安装到 /etc/NetworkManager/dispatcher.d/90-warp-optip-verify
+#
+
+[ -f /etc/warp-optip.conf ] || exit 0
+. /etc/warp-optip.conf
+
+[ "$ACTION" = "up" ] || exit 0
+[ "$CONNECTION_TYPE" = "wireguard" ] || exit 0
+[ "$CONNECTION_ID" = "${WARP_CONN:-warp-optip}" ] || exit 0
+
+# 服务正在运行时不重复启动
+systemctl is-active --quiet warp-optip.service && exit 0
+
+# 服务自己触发的 up 不递归
+if [ -f /run/warp-optip/self-up ]; then
+    now=$(date +%s)
+    ts=$(cat /run/warp-optip/self-up 2>/dev/null || echo 0)
+    if [ $((now - ts)) -lt 60 ]; then
+        rm -f /run/warp-optip/self-up
+        exit 0
+    fi
+fi
+
+systemctl start --no-block warp-optip.service

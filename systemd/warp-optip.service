@@ -1,0 +1,18 @@
+[Unit]
+Description=WARP endpoint optimizer (verify/repair)
+After=NetworkManager.service
+Wants=NetworkManager.service
+ConditionPathExists=/etc/warp-optip.conf
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/warp-optip verify
+TimeoutStartSec=10min
+Nice=10
+IOSchedulingClass=best-effort
+IOSchedulingPriority=7
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+# 不设置 WantedBy：只由 Dispatcher 或手动 systemctl start 触发

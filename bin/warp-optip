@@ -1,0 +1,8 @@
+#!/bin/sh
+#
+# warp-optip CLI wrapper
+#
+# 兼容自定义 --prefix：从自身位置推导 ../lib/warp-optip
+#
+SELF_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+exec "$SELF_DIR/../lib/warp-optip/warp-optip-engine.sh" "$@"

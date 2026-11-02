@@ -1,0 +1,33 @@
+#!/bin/sh
+#
+# WARP 优选 pre-up 钩子（同步）
+# 安装到 /etc/NetworkManager/dispatcher.d/pre-up.d/90-warp-optip
+#
+# 这个脚本在 NetworkManager 激活 WireGuard 的“正在连接”阶段运行。
+# 它最多等待 WARP_PREUP_TIMEOUT 秒，失败/超时也返回 0，让连接正常起来。
+#
+
+[ -f /etc/warp-optip.conf ] || exit 0
+. /etc/warp-optip.conf
+
+[ "$ACTION" = "pre-up" ] || exit 0
+[ "$CONNECTION_TYPE" = "wireguard" ] || exit 0
+[ "$CONNECTION_ID" = "${WARP_CONN:-warp-optip}" ] || exit 0
+
+mkdir -p "${WARP_STATE_DIR:-/var/lib/warp-optip}" 2>/dev/null || true
+mkdir -p /run/warp-optip 2>/dev/null || true
+
+# 服务自己触发的重新 up 不再扫描
+if [ -f /run/warp-optip/self-up ]; then
+    now=$(date +%s)
+    ts=$(cat /run/warp-optip/self-up 2>/dev/null || echo 0)
+    if [ $((now - ts)) -lt 60 ]; then
+        exit 0
+    fi
+fi
+
+timeout --signal=TERM --kill-after=5s "${WARP_PREUP_TIMEOUT:-25}s" \
+    /usr/local/bin/warp-optip pre-up \
+    >> "${WARP_STATE_DIR:-/var/lib/warp-optip}/pre-up.log" 2>&1
+
+exit 0
