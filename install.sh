@@ -19,6 +19,7 @@ VERIFY_SCRIPT="/etc/NetworkManager/dispatcher.d/90-warp-optip-verify"
 
 WGCF_VERSION=""                 # 为空表示每次安装都查询 GitHub 最新版
 WGCF_FALLBACK_VERSION="2.2.32"  # 仅当最新版获取和下载都失败时兜底
+WGCF_NET_TIMEOUT="${WGCF_NET_TIMEOUT:-8}"  # 查询 GitHub 的单次超时（秒）
 CONN=""
 NAME=""
 ACCOUNT=""
@@ -238,7 +239,7 @@ download_bin() {
     local url="$1" out="$2" what="$3"
     [[ "$NO_DOWNLOAD" -eq 0 ]] || return 1
     info "下载 $what: $url"
-    if ! curl -fL --retry 3 --max-time 180 -o "$out" "$url"; then
+    if ! curl -fL --retry 2 --connect-timeout 10 --max-time 180 -o "$out" "$url"; then
         rm -f "$out"
         return 1
     fi
@@ -248,8 +249,9 @@ download_bin() {
 
 # 查询 GitHub 最新 wgcf Release，返回 "version<TAB>url"
 resolve_wgcf_latest() {
-    local json ver url effective
-    json="$(curl -fsSL --max-time 20 \
+    local json="" ver="" url="" effective=""
+    local net_timeout="${WGCF_NET_TIMEOUT:-8}"
+    json="$(curl -fsSL --connect-timeout "$net_timeout" --max-time "$net_timeout" \
         -H 'Accept: application/vnd.github+json' \
         'https://api.github.com/repos/ViRb3/wgcf/releases/latest' 2>/dev/null || true)"
 
@@ -265,7 +267,8 @@ resolve_wgcf_latest() {
     fi
 
     if [[ -z "$ver" ]]; then
-        effective="$(curl -fsSIL --max-time 20 -o /dev/null -w '%{url_effective}' \
+        effective="$(curl -fsSIL --connect-timeout "$net_timeout" --max-time "$net_timeout" \
+            -o /dev/null -w '%{url_effective}' \
             'https://github.com/ViRb3/wgcf/releases/latest' 2>/dev/null || true)"
         ver="${effective##*/}"
         ver="${ver#v}"

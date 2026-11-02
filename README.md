@@ -170,7 +170,7 @@ warp-optip status
 ```bash
 sudo journalctl -u warp-optip -f
 sudo tail -f /var/lib/warp-optip/warp-optip.log
-sudo tail -f /var/lib/warp-optip/pre-up.log
+tail -f /run/warp-optip/pre-up.log
 ```
 
 ## 配置
@@ -220,6 +220,24 @@ nmcli connection up wgcf-profile
 
 ### pre-up 没触发
 
+先看 Dispatcher 自己的日志（不需要 sudo）：
+
+```bash
+cat /run/warp-optip/dispatcher.log
+```
+
+正常应该看到类似：
+
+```text
+pre-up-hook action=pre-up id=warp-optip type= iface=warp-optip
+verify-hook action=up id=warp-optip type= iface=warp-optip
+```
+
+注意：部分 NetworkManager 版本不会设置 `CONNECTION_TYPE`，所以 `type=` 为空是正常的。
+本项目只用连接名 `warp-optip` 过滤，不再强制要求 `CONNECTION_TYPE=wireguard`。
+
+如果这个文件不存在或没有内容，说明 Dispatcher 脚本根本没有执行，继续检查：
+
 ```bash
 nmcli -f connection.id,connection.type connection show warp-optip
 ls -l /etc/NetworkManager/dispatcher.d/pre-up.d/90-warp-optip
@@ -228,13 +246,23 @@ sudo journalctl -u NetworkManager -n 100 --no-pager
 
 Dispatcher 必须是 `root:root`、`0755`。
 
+注意：NetworkManager 不提供 `$ACTION` 变量，实际提供的是
+`$NM_DISPATCHER_ACTION`（以及 `$1`）。本项目已经使用：
+
+```sh
+action="${NM_DISPATCHER_ACTION:-${1:-}}"
+```
+
+如果旧版本安装的脚本里写的是 `[ "$ACTION" = ... ]`，重新运行
+`sudo ./install.sh` 更新 Dispatcher。
+
 ### 首次 up 卡很久
 
 pre-up 最多等 25 秒；超过会放弃扫描并让连接正常起来。
 看：
 
 ```bash
-sudo tail -n 100 /var/lib/warp-optip/pre-up.log
+tail -n 100 /run/warp-optip/pre-up.log
 ```
 
 ### pre-up 时 `wg set` 不生效
@@ -267,6 +295,14 @@ sudo warp-optip apply
 
 ```bash
 sudo ./install.sh --no-download --wgcf-bin ./wgcf --warp-bin ./warp
+```
+
+默认查询超时为每次 8 秒（API + 重定向各一次，最多约 16 秒）。想更快回退本地：
+
+```bash
+sudo ./install.sh --no-download
+# 或
+sudo WGCF_NET_TIMEOUT=3 ./install.sh
 ```
 
 或者固定一个已知版本：

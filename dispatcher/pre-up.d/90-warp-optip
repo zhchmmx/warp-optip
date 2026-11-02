@@ -10,8 +10,20 @@
 [ -f /etc/warp-optip.conf ] || exit 0
 . /etc/warp-optip.conf
 
-[ "$ACTION" = "pre-up" ] || exit 0
-[ "$CONNECTION_TYPE" = "wireguard" ] || exit 0
+mkdir -p /run/warp-optip 2>/dev/null || true
+echo "[$(date '+%F %T')] pre-up-hook action=${NM_DISPATCHER_ACTION:-${1:-}} id=${CONNECTION_ID:-} type=${CONNECTION_TYPE:-} iface=${DEVICE_IFACE:-}" \
+    >> /run/warp-optip/dispatcher.log 2>/dev/null || true
+
+# NetworkManager 提供的是 NM_DISPATCHER_ACTION（新版本），
+# 同时兼容历史上用 $1 传 action 的调用方式。
+action="${NM_DISPATCHER_ACTION:-${1:-}}"
+[ "$action" = "pre-up" ] || exit 0
+
+# 部分 NetworkManager 版本不会设置 CONNECTION_TYPE（为空）。
+# 连接名已经足够唯一，这里只在 type 有值时做一次过滤。
+if [ -n "${CONNECTION_TYPE:-}" ] && [ "$CONNECTION_TYPE" != "wireguard" ]; then
+    exit 0
+fi
 [ "$CONNECTION_ID" = "${WARP_CONN:-warp-optip}" ] || exit 0
 
 mkdir -p "${WARP_STATE_DIR:-/var/lib/warp-optip}" 2>/dev/null || true
@@ -28,6 +40,6 @@ fi
 
 timeout --signal=TERM --kill-after=5s "${WARP_PREUP_TIMEOUT:-25}s" \
     /usr/local/bin/warp-optip pre-up \
-    >> "${WARP_STATE_DIR:-/var/lib/warp-optip}/pre-up.log" 2>&1
+    >> /run/warp-optip/pre-up.log 2>&1
 
 exit 0
