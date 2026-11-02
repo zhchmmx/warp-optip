@@ -17,7 +17,8 @@ PREUP_DIR="/etc/NetworkManager/dispatcher.d/pre-up.d"
 PREUP_SCRIPT="$PREUP_DIR/90-warp-optip"
 VERIFY_SCRIPT="/etc/NetworkManager/dispatcher.d/90-warp-optip-verify"
 
-WGCF_VERSION="2.2.32"
+WGCF_VERSION=""                 # 为空表示每次安装都查询 GitHub 最新版
+WGCF_FALLBACK_VERSION="2.2.32"  # 仅当最新版获取和下载都失败时兜底
 CONN=""
 NAME=""
 ACCOUNT=""
@@ -44,9 +45,10 @@ usage() {
   --prefix DIR             安装前缀，默认 /usr/local
   --name NAME              新连接名，默认 warp-optip
   --state-dir DIR          状态目录，默认 /var/lib/warp-optip
-  --wgcf-bin PATH          指定 wgcf 二进制
-  --warp-bin PATH          指定优选扫描器
-  --wgcf-url URL           覆盖 wgcf 下载地址
+  --wgcf-bin PATH          指定 wgcf 二进制（跳过下载）
+  --warp-bin PATH          指定优选扫描器（跳过下载）
+  --wgcf-version VERSION   固定 wgcf 版本（默认每次拉取 GitHub 最新版）
+  --wgcf-url URL           覆盖 wgcf 下载地址（会跳过最新版查询）
   --warp-url URL           覆盖扫描器下载地址
   --no-download            只使用本地文件，缺失则报错
   --account FILE           使用现有 wgcf-account.toml
@@ -103,6 +105,7 @@ while [[ $# -gt 0 ]]; do
         --state-dir) STATE_DIR="$2"; shift ;;
         --wgcf-bin) WGCF_BIN="$2"; shift ;;
         --warp-bin) WARP_BIN="$2"; shift ;;
+        --wgcf-version) WGCF_VERSION="$2"; shift ;;
         --wgcf-url) WGCF_URL="$2"; shift ;;
         --warp-url) WARP_URL="$2"; shift ;;
         --no-download) NO_DOWNLOAD=1 ;;
@@ -168,6 +171,23 @@ fi
 
 info "连接名: $CONN"
 
+if [[ "$DRY_RUN" -eq 1 ]]; then
+    cat <<EOF
+[dry-run] 将执行：
+  - 安装连接名: $CONN (已存在则复用: $REUSE)
+  - 安装目录: $LIBDIR
+  - 状态目录: $STATE_DIR
+  - 配置文件: $CONF
+  - systemd 单元: $UNIT
+  - pre-up 脚本: $PREUP_SCRIPT
+  - up 校验脚本: $VERIFY_SCRIPT
+  - wgcf: ${WGCF_BIN:-将查询 GitHub 最新版并下载（--no-download 时只用本地）}
+  - warp: ${WARP_BIN:-本地优先，缺失则下载}
+[dry-run] 不做任何修改。
+EOF
+    exit 0
+fi
+
 # ---------- 查找二进制 ----------
 
 try_bin() {
@@ -184,7 +204,6 @@ find_local() {
             for p in \
                 "$SRC_DIR/wgcf" \
                 "$SRC_DIR/vendor/wgcf" \
-                "$SRC_DIR/wgcf_${WGCF_VERSION}_linux_${ARCH}" \
                 "$SRC_DIR"/wgcf_*_linux_"${ARCH}" \
                 "$SRC_DIR"/vendor/wgcf_*_linux_"${ARCH}" \
                 "$LIBDIR/wgcf" \
@@ -217,13 +236,48 @@ find_local() {
 
 download_bin() {
     local url="$1" out="$2" what="$3"
-    [[ "$NO_DOWNLOAD" -eq 0 ]] || die "$what 本地不存在，且指定了 --no-download"
+    [[ "$NO_DOWNLOAD" -eq 0 ]] || return 1
     info "下载 $what: $url"
     if ! curl -fL --retry 3 --max-time 180 -o "$out" "$url"; then
         rm -f "$out"
-        die "下载 $what 失败；请把文件放到项目目录，或用 --${what}-bin 指定"
+        return 1
     fi
     chmod +x "$out"
+    return 0
+}
+
+# 查询 GitHub 最新 wgcf Release，返回 "version<TAB>url"
+resolve_wgcf_latest() {
+    local json ver url effective
+    json="$(curl -fsSL --max-time 20 \
+        -H 'Accept: application/vnd.github+json' \
+        'https://api.github.com/repos/ViRb3/wgcf/releases/latest' 2>/dev/null || true)"
+
+    if [[ -n "$json" ]]; then
+        ver="$(printf '%s\n' "$json" \
+            | sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"v\{0,1\}\([^"]*\)".*/\1/p' \
+            | head -n1)"
+        url="$(printf '%s\n' "$json" \
+            | grep -o '"browser_download_url"[[:space:]]*:[[:space:]]*"[^"]*"' \
+            | sed 's/.*"\(https[^"]*\)"/\1/' \
+            | grep -E "_linux_${ARCH}$" \
+            | head -n1)"
+    fi
+
+    if [[ -z "$ver" ]]; then
+        effective="$(curl -fsSIL --max-time 20 -o /dev/null -w '%{url_effective}' \
+            'https://github.com/ViRb3/wgcf/releases/latest' 2>/dev/null || true)"
+        ver="${effective##*/}"
+        ver="${ver#v}"
+    fi
+
+    [[ "$ver" =~ ^[0-9]+([.][0-9]+)+$ ]] || return 1
+
+    if [[ -z "$url" ]]; then
+        url="https://github.com/ViRb3/wgcf/releases/download/v${ver}/wgcf_${ver}_linux_${ARCH}"
+    fi
+
+    printf '%s\t%s\n' "$ver" "$url"
 }
 
 TMPDIR_INSTALL="$(mktemp -d /tmp/warp-optip-install.XXXXXX)"
@@ -232,12 +286,61 @@ trap 'rm -rf "$TMPDIR_INSTALL"' EXIT
 if [[ -n "$WGCF_BIN" ]]; then
     [[ -f "$WGCF_BIN" ]] || die "wgcf 不存在: $WGCF_BIN"
     try_bin "$WGCF_BIN" --help || die "wgcf 无法运行: $WGCF_BIN"
-else
+    info "wgcf: 使用指定文件 $WGCF_BIN"
+elif [[ "$NO_DOWNLOAD" -eq 1 ]]; then
     WGCF_BIN="$(find_local wgcf || true)"
-    if [[ -z "$WGCF_BIN" ]]; then
-        WGCF_URL="${WGCF_URL:-https://github.com/ViRb3/wgcf/releases/download/v${WGCF_VERSION}/wgcf_${WGCF_VERSION}_linux_${ARCH}}"
+    [[ -n "$WGCF_BIN" ]] || die "本地没有 wgcf，且指定了 --no-download"
+    info "wgcf: 本地文件 $WGCF_BIN"
+else
+    WGCF_VER=""
+    WGCF_DL_URL=""
+
+    if [[ -n "$WGCF_URL" ]]; then
+        WGCF_DL_URL="$WGCF_URL"
+        info "wgcf: 使用自定义下载地址"
+    elif [[ -n "$WGCF_VERSION" ]]; then
+        WGCF_VER="$WGCF_VERSION"
+        WGCF_DL_URL="https://github.com/ViRb3/wgcf/releases/download/v${WGCF_VER}/wgcf_${WGCF_VER}_linux_${ARCH}"
+        info "wgcf: 固定版本 $WGCF_VER"
+    else
+        WGCF_RESOLVED="$(resolve_wgcf_latest || true)"
+        if [[ -n "$WGCF_RESOLVED" ]]; then
+            IFS=$'\t' read -r WGCF_VER WGCF_DL_URL <<< "$WGCF_RESOLVED"
+            info "wgcf: GitHub 最新版本 $WGCF_VER"
+        else
+            warn "无法查询 wgcf 最新版本，将尝试本地文件或兜底版本"
+        fi
+    fi
+
+    if [[ -n "$WGCF_DL_URL" ]]; then
         WGCF_BIN="$TMPDIR_INSTALL/wgcf"
-        download_bin "$WGCF_URL" "$WGCF_BIN" "wgcf"
+        if ! download_bin "$WGCF_DL_URL" "$WGCF_BIN" "wgcf"; then
+            warn "wgcf 下载失败，尝试本地文件"
+            WGCF_BIN="$(find_local wgcf || true)"
+            if [[ -z "$WGCF_BIN" ]]; then
+                warn "本地没有可用 wgcf，尝试兜底版本 $WGCF_FALLBACK_VERSION"
+                WGCF_DL_URL="https://github.com/ViRb3/wgcf/releases/download/v${WGCF_FALLBACK_VERSION}/wgcf_${WGCF_FALLBACK_VERSION}_linux_${ARCH}"
+                WGCF_BIN="$TMPDIR_INSTALL/wgcf"
+                download_bin "$WGCF_DL_URL" "$WGCF_BIN" "wgcf" \
+                    || die "下载 wgcf 失败；请把 wgcf 放到项目目录或用 --wgcf-bin 指定"
+            fi
+        fi
+    else
+        WGCF_BIN="$(find_local wgcf || true)"
+        if [[ -z "$WGCF_BIN" ]]; then
+            warn "本地没有 wgcf，尝试兜底版本 $WGCF_FALLBACK_VERSION"
+            WGCF_DL_URL="https://github.com/ViRb3/wgcf/releases/download/v${WGCF_FALLBACK_VERSION}/wgcf_${WGCF_FALLBACK_VERSION}_linux_${ARCH}"
+            WGCF_BIN="$TMPDIR_INSTALL/wgcf"
+            download_bin "$WGCF_DL_URL" "$WGCF_BIN" "wgcf" \
+                || die "下载 wgcf 失败；请把 wgcf 放到项目目录或用 --wgcf-bin 指定"
+        fi
+    fi
+
+    if ! try_bin "$WGCF_BIN" --help; then
+        warn "下载/选定的 wgcf 无法运行，尝试本地文件"
+        WGCF_BIN="$(find_local wgcf || true)"
+        [[ -n "$WGCF_BIN" ]] || die "wgcf 无法运行，且本地没有可用文件"
+        try_bin "$WGCF_BIN" --help || die "wgcf 无法运行: $WGCF_BIN"
     fi
 fi
 
@@ -247,31 +350,16 @@ if [[ -n "$WARP_BIN" ]]; then
 else
     WARP_BIN="$(find_local warp || true)"
     if [[ -z "$WARP_BIN" ]]; then
+        [[ "$NO_DOWNLOAD" -eq 0 ]] || die "本地没有扫描器，且指定了 --no-download"
         WARP_URL="${WARP_URL:-https://gitlab.com/Misaka-blog/warp-script/-/raw/main/files/warp-yxip/warp-linux-${ARCH}}"
         WARP_BIN="$TMPDIR_INSTALL/warp"
-        download_bin "$WARP_URL" "$WARP_BIN" "warp"
+        download_bin "$WARP_URL" "$WARP_BIN" "warp" \
+            || die "下载扫描器失败；请把 warp 放到项目目录或用 --warp-bin 指定"
     fi
 fi
 
 info "wgcf: $WGCF_BIN"
 info "warp: $WARP_BIN"
-
-if [[ "$DRY_RUN" -eq 1 ]]; then
-    cat <<EOF
-[dry-run] 将执行：
-  - 安装连接名: $CONN (已存在则复用: $REUSE)
-  - 安装目录: $LIBDIR
-  - 状态目录: $STATE_DIR
-  - 配置文件: $CONF
-  - systemd 单元: $UNIT
-  - pre-up 脚本: $PREUP_SCRIPT
-  - up 校验脚本: $VERIFY_SCRIPT
-  - wgcf: $WGCF_BIN
-  - warp: $WARP_BIN
-[dry-run] 不做任何修改。
-EOF
-    exit 0
-fi
 
 # ---------- 备份 ----------
 

@@ -59,11 +59,18 @@ sudo ./install.sh
 
 安装器会：
 
-1. 本地优先查找 `wgcf` / `warp`：
-   - `./wgcf`、`./wgcf_*_linux_<arch>`、`vendor/`
+1. 选择 `wgcf`：
+   - 指定了 `--wgcf-bin`：直接使用。
+   - 指定了 `--no-download`：只查找本地文件。
+   - 否则**每次都查询 GitHub 最新 Release 并下载**：
+     - 优先用 GitHub API 获取最新版本和对应 `linux_<arch>` 资源；
+     - API 不可用时通过 `releases/latest` 重定向获取版本号；
+     - 下载失败再回退到本地文件，最后才用兜底版本。
+2. 选择扫描器 `warp`（本地优先）：
+   - `./warp`、`./warp-linux-<arch>`、`vendor/`
    - `~/.local/state/warp-optip/warp`
-   - `/usr/local/lib/warp-optip/`
-2. 找不到才联网下载。
+   - `/usr/local/lib/warp-optip/warp`
+   - 都没有才联网下载。
 3. 新建独立连接名：
    - 默认 `warp-optip`
    - 已存在则尝试 `warp-optip-2`、`warp-optip-3`……
@@ -77,12 +84,18 @@ sudo ./install.sh
 6. 安装 Dispatcher 和 systemd 服务。
 7. 默认不激活、不开 autoconnect。
 
+> `vendor/` 里的第三方二进制默认不提交到 git；`install.sh` 会优先复用本地文件，
+> 缺失时再下载。离线安装可以手动把 `warp` / `wgcf` 放进 `vendor/`，它们不会被 git 跟踪。
+> 如果要发布完全自包含的离线包，建议把 `vendor/` 一起打进 Release 压缩包。
+
 ### 常用安装选项
 
 ```bash
 sudo ./install.sh --no-download                 # 只用本地二进制
-sudo ./install.sh --wgcf-bin /path/to/wgcf
-sudo ./install.sh --warp-bin /path/to/warp
+sudo ./install.sh --wgcf-bin /path/to/wgcf      # 指定 wgcf，跳过下载
+sudo ./install.sh --warp-bin /path/to/warp      # 指定扫描器，跳过下载
+sudo ./install.sh --wgcf-version 2.3.1          # 固定 wgcf 版本（默认最新版）
+sudo ./install.sh --wgcf-url URL                # 自定义 wgcf 下载地址
 sudo ./install.sh --name my-warp                # 自定义连接名
 sudo ./install.sh --account ./wgcf-account.toml # 复用账号
 sudo ./install.sh --profile ./wgcf-profile.conf # 复用 profile
@@ -245,12 +258,22 @@ sudo warp-optip scan
 sudo warp-optip apply
 ```
 
-### 下载失败
+### wgcf 最新版查询或下载失败
 
-把 `wgcf` / `warp` 放到项目目录，或：
+安装器会先尝试 GitHub API，再尝试 `releases/latest` 重定向；都失败时回退本地文件，
+最后才用兜底版本。
+
+如果 GitHub 网络不可用，可以直接使用本地文件：
 
 ```bash
 sudo ./install.sh --no-download --wgcf-bin ./wgcf --warp-bin ./warp
+```
+
+或者固定一个已知版本：
+
+```bash
+sudo ./install.sh --wgcf-version 2.3.1
+sudo ./install.sh --wgcf-url https://your-mirror/wgcf_2.3.1_linux_amd64
 ```
 
 ### 两个 WireGuard 连接冲突

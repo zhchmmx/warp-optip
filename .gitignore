@@ -1,0 +1,11 @@
+# 第三方二进制：默认不提交
+vendor/warp
+vendor/wgcf_*
+
+# 保留目录说明和可能的校验文件
+!vendor/README.md
+!vendor/SHA256SUMS
+
+# 本地临时文件
+*.log
+*.tmp
