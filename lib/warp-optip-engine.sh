@@ -29,8 +29,6 @@ WARP_MAX_LATENCY="${WARP_MAX_LATENCY:-200}"
 WARP_LIMIT="${WARP_LIMIT:-20}"
 WARP_ON_UP_POLICY="${WARP_ON_UP_POLICY:-keep}"
 WARP_CHECK_URL="${WARP_CHECK_URL:-https://1.1.1.1/cdn-cgi/trace}"
-# 扫描器可能只输出裸 IP（不带端口），此时按 WARP 默认 WireGuard 端口补齐
-WARP_DEFAULT_PORT="${WARP_DEFAULT_PORT:-2408}"
 WARP_SCAN_TIMEOUT="${WARP_SCAN_TIMEOUT:-18}"
 WARP_PREUP_TIMEOUT="${WARP_PREUP_TIMEOUT:-25}"
 
@@ -141,15 +139,11 @@ parse_candidates() {
     local file="${1:-$WARP_RESULT_CSV}"
     [[ -s "$file" ]] || return 1
 
-    awk -v maxloss="$WARP_MAX_LOSS" -v maxlat="$WARP_MAX_LATENCY" \
-        -v dport="$WARP_DEFAULT_PORT" -F',' '
+    awk -v maxloss="$WARP_MAX_LOSS" -v maxlat="$WARP_MAX_LATENCY" -F',' '
         NR == 1 { next }
         {
             ep = $1
             gsub(/^[ \t]+|[ \t]+$/, "", ep)
-            # 扫描器可能只给裸 IP，这里补上 WARP 默认端口
-            # 不用 {3} 区间写法：mawk 等实现不支持，会静默不匹配
-            if (ep ~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/) ep = ep ":" dport
             loss = $2
             gsub(/[% \t]/, "", loss)
             lat = $3
