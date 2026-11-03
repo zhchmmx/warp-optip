@@ -29,7 +29,7 @@ NetworkManager 完成激活
 dispatcher.d/90-warp-optip-verify（异步）
         ├─ action=up   -> warp-optip.service verify
         │                    ├─ 持久化 endpoint 到 NM profile
-        │                    ├─ 连续 3 次检查 warp=on
+        │                    ├─ 检查 warp=on（单次，curl 上限 10 秒）
         │                    ├─ 失败：用 pre-up 生成的候选逐个实测（不再扫描）
         │                    └─ 全失败：恢复旧 endpoint；再失败则断开 WARP
         └─ action=down -> systemctl stop（用户主动断开时中止修复）
@@ -123,7 +123,7 @@ nmcli connection up warp-optip
 - 图标显示“正在连接”；
 - pre-up 阶段直连扫描（约 5~30 秒）；
 - 用 `wg set` 设置优选 endpoint；
-- 激活后 verify 阶段连续检查 `warp=on`；
+- 激活后 verify 阶段检查 `warp=on`；
 - 成功后写入 `last-endpoint`。
 
 验证：

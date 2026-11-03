@@ -94,12 +94,8 @@ warp_is_active() {
 
 verify_warp() {
     local out
-    local i
-    for i in 1 2 3; do
-        out="$(curl -sS --max-time 8 "$WARP_CHECK_URL" 2>/dev/null)" || return 1
-        grep -qx 'warp=on' <<<"$out" || return 1
-        sleep 2
-    done
+    out="$(curl -sS --connect-timeout 5 --max-time 10 "$WARP_CHECK_URL" 2>/dev/null)" || return 1
+    grep -qx 'warp=on' <<<"$out" || return 1
     return 0
 }
 
