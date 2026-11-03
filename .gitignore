@@ -9,3 +9,5 @@ vendor/wgcf_*
 # 本地临时文件
 *.log
 *.tmp
+result.csv
+
