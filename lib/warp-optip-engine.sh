@@ -56,6 +56,18 @@ OLD_ENDPOINT_FILE="$WARP_STATE_DIR/old-endpoint"
 PENDING_ENDPOINT_FILE="$WARP_STATE_DIR/pending-endpoint"
 DISABLED_FILE="$WARP_STATE_DIR/disabled"
 
+# ---------- 通知（可选模块） ----------
+#
+# 单独一个文件，并且允许它不存在：通知只是锦上添花，读不到、执行失败、
+# 目标机器没装 notify-send，都不能影响连接和扫描。所以先定义空函数兜底，
+# 再判断可读才 source。
+warp_notify() { return 0; }
+NOTIFY_LIB="${WARP_NOTIFY_LIB:-$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)/warp-optip-notify.sh}"
+if [[ -r "$NOTIFY_LIB" ]]; then
+    # shellcheck disable=SC1090
+    . "$NOTIFY_LIB"
+fi
+
 IFACE="${DEVICE_IFACE:-$WARP_IFACE}"
 
 SCAN_CHILD=""
@@ -503,6 +515,7 @@ verify_mode() {
             printf '%s\n' "$ok_ep" > "$LAST_ENDPOINT_FILE"
             rm -f "$PENDING_ENDPOINT_FILE" 2>/dev/null || true
             log "verify: 连通正常，当前 endpoint=$ok_ep"
+            warp_notify ok "endpoint ${ok_ep:-未知}"
             return 0
         fi
         log "verify: 首次运行且 pre-up 未产生候选，继续执行优选"
@@ -514,6 +527,7 @@ verify_mode() {
         if try_candidates "$cur_ep"; then
             rm -f "$PENDING_ENDPOINT_FILE" 2>/dev/null || true
             log "verify: 候选切换成功"
+            warp_notify ok "已切换到 $(cat "$LAST_ENDPOINT_FILE" 2>/dev/null || echo 未知)"
             return 0
         fi
     fi
@@ -523,10 +537,12 @@ verify_mode() {
         printf '%s\n' "$restore_ep" > "$LAST_ENDPOINT_FILE"
         rm -f "$PENDING_ENDPOINT_FILE" 2>/dev/null || true
         log "verify: 已恢复旧 endpoint"
+        warp_notify ok "候选均不通，已回退原 endpoint"
         return 1
     fi
 
     log "verify: 旧 endpoint 也不可用，断开 $WARP_CONN 以保留物理网络"
+    warp_notify fail "所有 endpoint 都不通，已断开隧道走物理网络"
     nmcli --wait 10 connection down "$WARP_CONN" >/dev/null 2>&1 || true
     return 2
 }

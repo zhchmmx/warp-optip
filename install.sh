@@ -129,6 +129,8 @@ done
 
 LIBDIR="$PREFIX/lib/warp-optip"
 BINDIR="$PREFIX/bin"
+APPSDIR="$PREFIX/share/applications"
+DESKTOP_FILE="$APPSDIR/warp-optip.desktop"
 
 if [[ "$DRY_RUN" -eq 0 && "$(id -u)" -ne 0 ]]; then
     die "请用 sudo 运行: sudo $0"
@@ -146,6 +148,17 @@ if LC_ALL=C nmcli device reapply --help >/dev/null 2>&1; then
 else
     warn "无法确认 nmcli device reapply 可用（需要 NetworkManager >= 1.12）。"
     warn "若后续日志出现 'reapply 失败'，说明优选 endpoint 无法生效，需升级 NetworkManager。"
+fi
+
+# 桌面通知是可选功能，不作为硬性依赖：
+# notify-send 属于 libnotify，Silverblue 上不一定有；没有它时代码退回
+# glib2 自带的 gdbus，两个都找不到时只是不提示，其他一切照常。
+if command -v notify-send >/dev/null 2>&1; then
+    info "桌面通知: notify-send"
+elif command -v gdbus >/dev/null 2>&1; then
+    info "桌面通知: 未安装 libnotify，改用 gdbus"
+else
+    warn "未找到 notify-send 和 gdbus，连通通知会被跳过"
 fi
 
 ARCH="$(arch_affix)"
@@ -188,6 +201,7 @@ if [[ "$DRY_RUN" -eq 1 ]]; then
   - 安装目录: $LIBDIR
   - 状态目录: $STATE_DIR
   - 配置文件: $CONF
+  - 桌面条目: $DESKTOP_FILE
   - systemd 单元: $UNIT
   - pre-up 脚本: $PREUP_SCRIPT
   - up 校验脚本: $VERIFY_SCRIPT
@@ -417,7 +431,26 @@ if [[ "$WARP_BIN" != "$LIBDIR/warp" ]]; then
     run install -m 0755 "$WARP_BIN" "$LIBDIR/warp"
 fi
 run install -m 0755 "$SRC_DIR/lib/warp-optip-engine.sh" "$LIBDIR/warp-optip-engine.sh"
+# 通知模块是被 source 的库，不需要执行位；缺失时 engine 用空函数兜底
+run install -m 0644 "$SRC_DIR/lib/warp-optip-notify.sh" "$LIBDIR/warp-optip-notify.sh"
 run install -m 0755 "$SRC_DIR/bin/warp-optip" "$BINDIR/warp-optip"
+
+# GNOME 按 app_name 找同名 .desktop 来决定通知的显示名和图标。
+# ostree 上 /usr/share 只读，$PREFIX/share（/usr/local -> /var/usrlocal）可写。
+cat > "$TMPDIR_INSTALL/warp-optip.desktop" <<'EOF'
+[Desktop Entry]
+Type=Application
+Name=warp-optip
+GenericName=WARP endpoint optimizer
+GenericName[zh_CN]=WARP endpoint 优选
+Comment=Reports WARP connectivity from a system service
+Comment[zh_CN]=系统服务的 WARP 连通状态提示
+Icon=network-vpn
+NoDisplay=true
+X-GNOME-UsesNotifications=true
+EOF
+run install -d -m 0755 "$APPSDIR"
+run install -m 0644 "$TMPDIR_INSTALL/warp-optip.desktop" "$DESKTOP_FILE"
 
 if [[ "$NO_SERVICE" -eq 0 ]]; then
     sed "s#/usr/local/bin/warp-optip#$BINDIR/warp-optip#g" \
@@ -469,6 +502,12 @@ WARP_SCAN_FORCE_PHYSICAL=1
 WARP_SCAN_RULE_PREF=30000
 # 仅用于日志：验证扫描流量实际走物理网关
 WARP_SCAN_PROBE_IP=162.159.192.1
+
+# 连通/失败时发一条桌面通知（1 开启，0 关闭）。
+# 通知发给「当前有登录会话的用户」；多用户机器可以写死用户名。
+# 发不出时静默，不影响任何功能。
+WARP_NOTIFY=1
+WARP_NOTIFY_USER=
 EOF
 )"
 

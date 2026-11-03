@@ -85,6 +85,7 @@ run rm -f "$PREUP_SCRIPT"
 run rm -f "$VERIFY_SCRIPT"
 run rm -f "$BINDIR/warp-optip"
 run rm -rf "$LIBDIR"
+run rm -f "$PREFIX/share/applications/warp-optip.desktop"
 run rm -f "$CONF"
 run rm -rf /run/warp-optip
 

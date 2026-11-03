@@ -54,6 +54,7 @@ verify 阶段。
 - Linux + NetworkManager >= 1.12（支持原生 WireGuard 和 `nmcli device reapply`）
 - `nmcli`、`ip`、`systemctl`、`curl`、`awk`、`flock`、`timeout`、`wg`
 - root/sudo
+- 桌面通知可选：优先 `notify-send`（libnotify），没有时退回 glib2 自带的 `gdbus`
 - 首次注册需要访问 Cloudflare API；下载二进制需要网络（或本地提供）
 
 ## 安装
@@ -189,6 +190,25 @@ sudo tail -f /var/lib/warp-optip/warp-optip.log
 tail -f /run/warp-optip/pre-up.log
 ```
 
+### 桌面通知
+
+`verify` 走到最终结论时发一条系统通知，之后就可以不看日志：
+
+- `warp=on` 通过：`WARP 已连通`，正文带当前 endpoint
+- 所有候选和原 endpoint 都不通、已断开隧道退回物理网络：`WARP 无法连通`
+
+通知由 root 的 systemd 服务发出，但**不是**以 root 身份发：桌面通知走登录用户
+自己的 D-Bus session bus（`/run/user/<uid>/bus`），而 D-Bus 用 `SO_PEERCRED`
+校验连接方的 uid，uid 对不上连接会被直接关掉。所以代码先 `runuser -u <用户>`
+降权、再带上该用户的总线地址发送。`DISPLAY`/`XAUTHORITY`/`WAYLAND_DISPLAY`
+在这条链路上都不需要。
+
+接收者默认取「当前有登录会话的用户」（`loginctl`，取不到时扫 `/run/user/*/bus`），
+多用户或自动登录场景可以在配置里写死 `WARP_NOTIFY_USER`。
+
+这是纯附加功能：没人登录、没装通知工具、GNOME 开了免打扰，都只会静默跳过，
+每条外部命令都带超时，不会拖慢 `verify`。日志里出现 `通知未送达` 说明当时没发出去。
+
 ## 配置
 
 `/etc/warp-optip.conf`：
@@ -218,6 +238,12 @@ WARP_SCAN_FORCE_PHYSICAL=1
 WARP_SCAN_RULE_PREF=30000
 # 只用于日志：验证扫描流量实际走物理网关
 WARP_SCAN_PROBE_IP=162.159.192.1
+
+# 桌面通知：1 开启 / 0 关闭；留空用户名表示自动选当前登录会话的用户
+WARP_NOTIFY=1
+WARP_NOTIFY_USER=
+WARP_NOTIFY_DEDUPE=60
+WARP_NOTIFY_TIMEOUT=3
 ```
 
 ## 卸载
