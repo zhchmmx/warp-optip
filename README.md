@@ -2,10 +2,14 @@
 
 WARP Endpoint 自动优选工具。
 
-- 在 NetworkManager **pre-up** 阶段（正在连接时）同步扫描生成候选列表并设置优选 endpoint。
+- 在 NetworkManager **pre-up** 阶段（正在连接时）同步扫描生成候选列表，并用真实流量
+  逐个实测，把**扫描结果的假阳性**在激活完成之前筛掉。
+- 每个候选实测前先把 peer 删掉再原样重建，逼出一次全新的握手；
+  判据是「这一轮握手时刻确实前进了，并且 `warp=on`」，两者缺一都不算通过。
 - 扫描期间用临时 `ip rule` 把探测流量压回物理网络，避免被 WireGuard 策略路由带进隧道。
-- up 之后异步校验 `warp=on`，失败则用候选逐个实测换下一个。
-- 扫描只发生在 pre-up；verify 不会为了扫描断开已有连接，用户主动断开时 verify 立即中止。
+- 实测通过的那个 endpoint 才写回 NM profile（up 之后），不通过就不换。
+- pre-up 没给出结论、或写回 profile 后隧道又不通时，verify 退回「up 后逐个实测」的
+  兜底流程；所有候选连旧 endpoint 都不通才断开隧道，保证物理网络可用。
 - 程序全程不执行 `nmcli connection up`：隧道只可能由用户打开，因此一定关得掉。
 - 首次安装会新建独立连接（默认 `warp-optip`），**不修改现有 `wgcf-profile`**。
 
@@ -16,32 +20,86 @@ nmcli connection up warp-optip
         │
         ▼
 NetworkManager: 正在连接（pending）
-        │
+        │   l3cfg（地址/路由/ip rule/fwmark）已提交，隧道已经在承载流量
         ▼
-pre-up.d/90-warp-optip   （同步，最多 25 秒）
+pre-up.d/90-warp-optip   （同步，最多 60 秒，NM 卡住激活等它返回）
         ├─ 临时 ip rule：扫描网段强制走物理表（main）
-        ├─ 每次 up 都直连扫描，生成候选列表（只传 -ip/-o，并发用扫描器内置默认）
+        ├─ 直连扫描，生成候选列表（只传 -ip/-o，并发用扫描器内置默认）
         ├─ 删除临时 ip rule
-        ├─ 选候选
-        ├─ wg set <iface> peer <pub> endpoint IP:PORT
-        └─ 返回
+        ├─ peer 重建演练（用激活时那个 endpoint）：
+        │    remove 成功、装回也成功 -> 后面走「删 peer 逼冷握手」这条路
+        │    remove 被拒 -> 退化成只换 endpoint，靠握手闸门挡假阳性
+        │    删得掉装不回 -> 立刻收手（附 wg 的原始报错 + 设备公钥状态），交给 verify 修复
+        └─ 候选按延迟升序逐个实测（数量沿用 WARP_LIMIT，装不进预算就截止）：
+             wg set <iface> peer <pub> remove
+             wg set <iface> peer <pub> allowed-ips <原值> endpoint IP:PORT
+             -> 全新 peer、握手清零，绝不继承上一次的成功会话
+             -> curl 驱动握手并确认 warp=on（连接超时 5 秒，单轮 WARP_PREUP_ROUND_BUDGET 秒）
+             -> 握手时刻有更新 且 warp=on：写 pending-endpoint，结束
+             -> 否则试下一个；全部不通则重建 peer 回退旧 endpoint
+             -> 任何一次 peer 装不回去就停止实测并把 peer 还原，不在没有 peer 的接口上继续试
         │
         ▼
-NetworkManager 完成激活
+NetworkManager 完成激活（此时隧道已经走在实测通过的 endpoint 上）
         │
         ▼
 dispatcher.d/90-warp-optip-verify（异步）
         ├─ action=up   -> warp-optip.service verify
-        │                    ├─ 持久化 endpoint 到 NM profile
-        │                    ├─ 检查 warp=on（单次，curl 上限 10 秒）
-        │                    ├─ 失败：用 pre-up 生成的候选逐个实测（不再扫描）
-        │                    └─ 全失败：恢复旧 endpoint；再失败则断开 WARP
-        └─ action=down -> systemctl stop（用户主动断开时中止修复）
+        │                    ├─ 有 pending：只 `connection modify` 写进 profile + 确认一次
+        │                    │  （profile 只能在 up 之后改；绝不 reapply，reapply 会
+        │                    │    重建 peer、把刚验过的好隧道打断）
+        │                    ├─ 没 pending 而隧道本来就通：什么都不改
+        │                    └─ 隧道不通：退回 up 后逐个实测（modify + reapply + curl），
+        │                       仍全不通才恢复旧 endpoint，最后断开 WARP
+        └─ action=down -> systemctl stop（用户主动断开时立即中止）
 ```
 
 pre-up 阶段**不能**调用 `nmcli connection up/down/modify`，否则可能和 NetworkManager
-死锁。因此 pre-up 只用 `wg set` 改运行时 endpoint；`nmcli` 操作全部放在 up 后的
-verify 阶段。
+死锁。因此 pre-up 只用 `wg set` 改运行时 endpoint；写 profile 的 `nmcli` 操作放在
+up 后的 verify 阶段。优选本身不依赖 `nmcli`，所以完全放在 pre-up。
+
+为什么实测能放进 pre-up：NetworkManager 在 `ip-check` 阶段末尾才派发 pre-up
+（`ip_check_pre_up()`），此时 WireGuard 的地址、路由、`ip rule`、fwmark 都已生效，
+激活只是卡住等脚本返回。实测过：`wg show` 在 pre-up 有值、`wg set` 生效、
+随后的流量确实走刚设上去的 endpoint。既然隧道已经在跑，`curl .../cdn-cgi/trace`
+就能直接给出答案，不必等到 up 之后。
+
+扫描器给的延迟是 UDP 层的数字，会假阳性（实测中 0% 丢包、70ms 的 endpoint
+可以完全不通）。以前由 up 后的 verify 逐个试错，用户会在几十秒里用一条坏隧道；
+现在这一步挪到激活完成之前，代价只是"正在连接"多转几十秒。
+
+**光测 `warp=on` 不够，必须同时看握手。** WireGuard 的会话是挂在 peer 上的，
+和 endpoint 无关；Cloudflare 这批 anycast IP 又共用同一把私钥。所以只要隧道
+之前握手成功过，仅仅 `wg set ... endpoint` 换一个 IP，内核并不会因此重新握手
+（`REKEY_AFTER_TIME_USELESS` 约 11 秒），curl 照样返回 `warp=on`——这个结论
+根本不属于刚设上去的那个 endpoint。这就是第一版 pre-up 实测的假阳性来源。
+现在每个候选前先 `peer remove` 再原样重建（私钥在 device 上，不受影响），
+会话被清零，握手必须重来；通过的条件是「`warp=on` 且握手时刻比本轮开始时新」。
+
+**但这个 peer 是 NetworkManager 建的，删它不是我们天然就有的权限。**
+真实日志里出现过删除全部成功、装回全部失败，接口被连着删了 20 次、停在
+没有 peer 的状态，而 `wg` 的报错当时被 `2>/dev/null` 吞了。现在实测前先做一次
+演练：用激活时那个 endpoint 删掉再装回。装不回就立刻停手，日志里带上 `wg set`
+的原始报错和设备公钥状态，由 verify 的 `connection modify` + `device reapply`
+把 peer 修回来。演练过了才在候选循环里重复这套删除重建；演练时被拒则退化成
+只换 endpoint，此时握手闸门依然能挡住继承会话的假阳性，只是很难有候选能过关。
+
+**`wg show` 的显示格式不能直接喂给 `wg set`。** `wg show <iface> allowed-ips`
+打出来的是**空格**分隔的两个族（`0.0.0.0/0 ::/0`），而 `wg set` 要的是逗号分隔。
+第一版用 `gsub` 去掉空格，把两个族粘成了 `0.0.0.0/0::/0`，`wg set` 直接报
+`AllowedIP is not in the correct format`——这就是"每个候选都重建失败"的真正根因。
+现在按逗号和空白一起切块再重新拼，并在递给 `wg set` 之前校验形状，
+认不出来就按"读不到 allowed-ips"处理、走退化路径，绝不把怪字符串送进内核。
+
+**反过来，只看握手也不能下结论。** 握手成功只说明对端应答了密钥包，
+不代表这个 IP 会正常转发我们的流量。所以两步都要：新会话 + `warp=on`。
+
+**单轮预算不能压得太小。** endpoint 不通时 WireGuard 只是静默丢包，不会漏到
+物理网卡，所以 `warp=on` 为真一定走的是刚设上去的 endpoint；但反过来，一次冷握手
+在这台机器上要 3~6 秒，这期间内核把包暂存在 staged-packets 队列里、握手完成才放行。
+连接超时如果只给 3 秒，就会每次都卡在包被释放之前——这是第一版实测的假阴性来源。
+现在沿用 up 后老流程的数值：连接超时 5 秒、单轮总超时 `WARP_PREUP_ROUND_BUDGET` 秒
+（低于 6 秒会被自动抬到 6）。
 
 另外，NetworkManager 会在激活开始后几百毫秒内装好 WireGuard 的自动默认路由
 （`ip rule ... lookup 52289` + fwmark），此时扫描流量会被带进隧道，测到的就不是
@@ -132,10 +190,10 @@ nmcli connection up warp-optip
 首次会：
 
 - 图标显示“正在连接”；
-- pre-up 阶段直连扫描（约 5~30 秒）；
-- 用 `wg set` 设置优选 endpoint；
-- 激活后 verify 阶段检查 `warp=on`；
-- 成功后写入 `last-endpoint`。
+- pre-up 阶段直连扫描（约 5~30 秒），再按延迟升序逐个实测；
+- 用 `wg set` 把第一个实测通过的 endpoint 设成运行时 endpoint；
+- 激活完成时隧道已经走在优选 endpoint 上；
+- verify 把它持久化进 profile，写入 `last-endpoint`，发一条通知。
 
 验证：
 
@@ -153,14 +211,22 @@ nmcli connection down warp-optip
 
 每次 up：
 
-- pre-up 阶段无条件直连扫描，生成新的候选列表（最多 25 秒，图标显示“正在连接”）。
-  扫描期间探测流量被临时规则压回物理网络，不会走当前隧道。
-- 当前 endpoint 健康：verify 只确认 `warp=on`，不换 IP、不断网。
-- 当前 endpoint 不健康：用本次扫描出的候选逐个实测，直到连通；verify 不会重新扫描。
-- 全部失败：恢复旧 endpoint；旧 endpoint 也不行则断开 WARP，保证物理网络可用。
-- 用户在 verify 期间主动断开：服务被 `systemctl stop` 终止，不会把隧道重新打开。
+- pre-up 阶段无条件直连扫描，生成新的候选列表；扫描期间探测流量被临时规则压回
+  物理网络，不会走当前隧道。
+- 紧接着在 pre-up 里按延迟升序实测候选，数量沿用 `WARP_LIMIT`（和 up 后的兜底循环
+  同源），单轮 `WARP_PREUP_ROUND_BUDGET` 秒，总预算 `WARP_PREUP_TIMEOUT` 秒，
+  装不进预算就自然截止。第一个「新会话 + `warp=on`」通过的就被留下，
+  激活完成时你用的已经是优选后的 endpoint。
+- 当前 endpoint 本来就健康时，实测通常在头几轮内命中，verify 只做持久化，
+  不换 IP、不断网。
+- 全部候选实测都不通：运行时 endpoint 回退到激活时的那个；verify 随后退回
+  up 后逐个实测的老流程，仍然全不通才恢复旧 endpoint、最后断开 WARP。
+- 用户在 pre-up 期间主动断开：接口被 NM 销毁重建，`ifindex` 一变实测立即停止，
+  不会把结论写到别的实例上。
 
-> 扫描失败时 `result.csv` 保持上一次成功扫描的内容不变，verify 仍能拿到候选列表。
+> 扫描失败时 `result.csv` 保持上一次成功扫描的内容不变，pre-up 本轮不实测、
+> 不换 endpoint，隧道照原样起来；verify 看到没有 pre-up 结论，会改用 up 后
+> 逐个实测的兜底流程（前提是这张旧表里还有能用的候选）。
 
 ### 手动命令
 
@@ -195,6 +261,7 @@ tail -f /run/warp-optip/pre-up.log
 `verify` 走到最终结论时发一条系统通知，之后就可以不看日志：
 
 - `warp=on` 通过：`WARP 已连通`，正文带当前 endpoint
+- 候选全不通、但原来的 endpoint 又能连通：`WARP 已连通`，正文说明回退到了哪个 endpoint
 - 所有候选和原 endpoint 都不通、已断开隧道退回物理网络：`WARP 无法连通`
 
 通知由 root 的 systemd 服务发出，但**不是**以 root 身份发：桌面通知走登录用户
@@ -230,12 +297,19 @@ WARP_MAX_LOSS=20
 WARP_MAX_LATENCY=200
 WARP_LIMIT=20
 
+# 当前已不生效：pre-up 扫描 + 实测，up 后只做持久化，不通才退回逐个实测
 WARP_ON_UP_POLICY=keep
 
 WARP_CHECK_URL=https://1.1.1.1/cdn-cgi/trace
 
 WARP_SCAN_TIMEOUT=18
-WARP_PREUP_TIMEOUT=25
+WARP_PREUP_TIMEOUT=60
+
+# pre-up 实测：候选数量沿用 WARP_LIMIT，装不进 WARP_PREUP_TIMEOUT 就自然截止。
+# 扫描的延迟是 UDP 层的数字会假阳性，真正的判据是「重建 peer 逼出冷握手之后」
+# warp=on，且握手时刻有更新。单轮预算要罩住冷握手（3~6 秒）+ TLS + 响应，
+# 低于 6 秒会被自动抬到 6（curl 的连接超时是 5 秒）。
+WARP_PREUP_ROUND_BUDGET=12
 
 # 扫描时强制走物理网络（pre-up 阶段 NM 已装好 WG 策略路由）
 # NM 的规则优先级由连接 UUID 派生，范围 30768~31766，这里必须更小
@@ -311,13 +385,41 @@ action="${NM_DISPATCHER_ACTION:-${1:-}}"
 
 ### up 时“正在连接”很久
 
-每次 up 的 pre-up 都会扫描，最多等 25 秒；超过会放弃扫描并让连接正常起来，
-verify 阶段改用上一次成功扫描的候选列表。
+pre-up 里要做完「扫描 + 逐个实测」，总预算 `WARP_PREUP_TIMEOUT`（默认 60 秒），
+Dispatcher 外层再多给 10 秒兜底；到点就带着已有结论返回，让连接正常起来。
+NetworkManager 对 dispatcher 脚本的调用上限是 10 分钟，60 秒很安全。
+
+第一次连某个网络时慢是可以预期的：扫到 1792 个地址就要十几秒，如果排在前面
+的候选全是假阳性，还得一轮轮实测下去。真觉得受不了，可以调小
+`WARP_LIMIT`（它同时决定 pre-up 实测和 up 后兜底的候选数，比如 8）
+或 `WARP_SCAN_RANGES`，代价是优选质量。
+一个连上要 60 秒以上的网络，本来也不适合连 WARP。
+
 看：
 
 ```bash
 tail -n 100 /run/warp-optip/pre-up.log
 ```
+
+日志里每个候选都有一行结论：「实测通过」「扫描 XXms 很好但实测不通」或
+「返回 warp=on 但握手没有更新」，还带本轮的握手时刻变化（`握手 0->1793…`），
+慢在哪一步、哪一轮是假阳性一眼就能看出来。
+每次 `wg set` 失败都会把它自己的报错原样写进日志（`wg set ... 失败(退出码 1): ...`），
+不需要再去猜是权限还是参数问题。
+
+### 日志出现「peer 删除成功但装不回去」
+
+这条是老流程能救、新流程故意不试的情况：这次激活的 peer 是 NetworkManager 建的，
+我们从外面删它、再装回去，中间任何一步被拒都可能装不回（参数不合法、设备还没
+配上私钥、NM 正在改同一个设备）。日志紧跟的两行会给出答案：`wg set` 的原始报错，
+以及「设备公钥: …」——报 `AllowedIP is not in the correct format` 是参数问题，
+报 `Operation not permitted` 且设备公钥那行是空的，才是私钥/权限问题。
+
+处理方式是当场停手：不删第二遍、不进候选循环，verify 起来后用
+`connection modify` + `device reapply` 让 NM 自己把 peer 装回来，再走 up 后逐个实测。
+表现就是"连接慢一点、结论照样对"，不需要你做任何事。
+如果这行日志频繁出现，说明这台机器的 pre-up 时机不适合重建 peer，
+可以把 `WARP_LIMIT` 调小让兜底流程少试几个候选，或者直接把它当纯兜底用。
 
 ### pre-up 时 `wg set` 不生效
 
@@ -327,14 +429,23 @@ tail -n 100 /run/warp-optip/pre-up.log
 sudo journalctl -u NetworkManager -n 100 --no-pager
 ```
 
-若 NetworkManager 在 pre-up 后覆盖了运行时 endpoint，verify 阶段会用
-`nmcli connection modify` + `nmcli device reapply` 重新应用配置。程序本身不执行
-`nmcli connection up`，所以隧道只可能由用户打开。
+pre-up 派发时 l3cfg 已经提交，`wg show <iface> endpoints` 一定有值；如果日志出现
+「接口 warp-optip 或它的 peer 还没就绪」，说明这个连接名和实际接口名不一致，
+检查 `WARP_IFACE` 或 `DEVICE_IFACE`。
+
+若 NetworkManager 在 pre-up 后覆盖了运行时 endpoint，verify 会用
+`nmcli connection modify` 把 pre-up 实测通过的 endpoint 写进 profile。
+verify 不会 `device reapply`：reapply 会重建 peer、丢掉刚验证过的会话，
+而运行时 endpoint 本来就是对的。只有在隧道确实不通、需要逐个试候选时，
+兜底流程才用 `modify` + `reapply`。程序本身不执行 `nmcli connection up`，
+所以隧道只可能由用户打开。
 
 ### 当前 IP 不健康但不换
 
-只有 verify 实测 `warp=on` 失败才会切换候选；endpoint 实测通过就保留。
-强制重新优选：
+只有 pre-up 实测「新会话 + `warp=on`」都成立的候选才会被换上；
+扫描延迟再低、实测不通就不换。如果 pre-up 被整个跳过（没抢到锁、被 self-up
+标记抑制、扫描失败），verify 会退回 up 后逐个实测的兜底流程；要立刻重新优选，
+手动来一次：
 
 ```bash
 sudo warp-optip scan

@@ -485,7 +485,15 @@ WARP_ON_UP_POLICY=keep
 WARP_CHECK_URL=https://1.1.1.1/cdn-cgi/trace
 
 WARP_SCAN_TIMEOUT=18
-WARP_PREUP_TIMEOUT=25
+WARP_PREUP_TIMEOUT=60
+
+# pre-up 实测：扫描出的候选延迟再好看也只是 UDP 层的数字，
+# 真正的判据是「重建 peer 逼出一次冷握手之后」能不能 warp=on。
+# 候选数量直接用 WARP_LIMIT（和 up 后的修复循环一样多），
+# 装不进 WARP_PREUP_TIMEOUT 就自然截止。
+# 单轮预算必须罩住一次冷握手（3~6 秒）+ TLS + 响应，别调到 6 以下。
+# 连一个 VPN 都要超过 60 秒的网络，本来就不适合连。
+WARP_PREUP_ROUND_BUDGET=12
 
 # 扫描时强制探测流量走物理网络（pre-up 阶段 NM 已装好 WG 策略路由）
 # NM 的规则优先级由连接 UUID 派生，范围 30768~31766；这里必须比它小
@@ -553,8 +561,9 @@ if [[ "$REUSE" -eq 0 ]]; then
     install -m 0600 "$TMPDIR_INSTALL/wgcf-account.toml" "$STATE_DIR/wgcf-account.toml"
     install -m 0600 "$TMPDIR_INSTALL/$CONN.conf" "$STATE_DIR/$CONN.conf"
 
-    # 新连接：清掉旧连接留下的 last/pending，确保首次启动会优选
-    rm -f "$STATE_DIR/last-endpoint" "$STATE_DIR/pending-endpoint" "$STATE_DIR/old-endpoint" 2>/dev/null || true
+    # 新连接：清掉旧连接留下的状态，确保首次启动会重新优选
+    rm -f "$STATE_DIR/last-endpoint" "$STATE_DIR/pending-endpoint" \
+          "$STATE_DIR/old-endpoint" 2>/dev/null || true
 
     info "导入 NetworkManager 连接"
     IMPORTED="$(import_connection "$TMPDIR_INSTALL/$CONN.conf")"
@@ -597,7 +606,7 @@ if [[ "$ACTIVATE" -eq 1 && "$DRY_RUN" -eq 0 ]]; then
         warn "以下 WireGuard 连接正在活动: $active_wg"
         warn "请先手动断开，再执行: nmcli connection up $CONN"
     else
-        info "激活 $CONN（pre-up 阶段会同步优选，可能等待几秒）"
+        info "激活 $CONN（pre-up 阶段同步扫描 + 实测，最多等 60 秒）"
         nmcli connection up "$CONN" || warn "激活失败，请查看 journalctl -u NetworkManager"
     fi
 fi
@@ -614,6 +623,6 @@ cat <<EOF
 下一步:
   nmcli connection up $CONN
 
-首次 up 会在“正在连接”阶段扫描并应用优选 endpoint。
-之后每次 up 如果当前 endpoint 健康，会直接保留。
+首次 up 会在“正在连接”阶段扫描 + 逐个实测，激活完成时已经是优选后的 endpoint。
+之后每次 up 都会重新扫描实测；当前 endpoint 够用就保留，不换 IP。
 EOF

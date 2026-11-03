@@ -1,8 +1,8 @@
 #!/bin/sh
 #
-# WARP 优选校验钩子（异步）
+# WARP endpoint 持久化钩子（异步）
 # 安装到 /etc/NetworkManager/dispatcher.d/90-warp-optip-verify
-# up 时启动校验/修复服务，down 时终止它。
+# up 时启动服务把 pre-up 实测通过的 endpoint 写进 profile，down 时终止它。
 #
 
 [ -f /etc/warp-optip.conf ] || exit 0
@@ -41,8 +41,8 @@ if [ -f /run/warp-optip/self-up ]; then
 fi
 
 if [ "$action" != "up" ]; then
-    # 用户主动断开：终止正在进行的校验/修复，
-    # 否则它下一轮候选尝试会把隧道重新打开。
+    # 用户主动断开：终止正在进行的持久化，
+    # 否则它的 device reapply 可能把隧道重新打开。
     [ "$self_up" -eq 1 ] && exit 0
     systemctl stop --no-block warp-optip.service
     exit 0

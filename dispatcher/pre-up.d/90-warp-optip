@@ -4,7 +4,9 @@
 # 安装到 /etc/NetworkManager/dispatcher.d/pre-up.d/90-warp-optip
 #
 # 这个脚本在 NetworkManager 激活 WireGuard 的“正在连接”阶段运行。
+# 此时隧道的地址/路由/规则已经全部提交，所以这里能直接用真实流量实测候选。
 # 它最多等待 WARP_PREUP_TIMEOUT 秒，失败/超时也返回 0，让连接正常起来。
+# NetworkManager 的 dispatcher 调用上限是 10 分钟，60 秒很安全。
 #
 
 [ -f /etc/warp-optip.conf ] || exit 0
@@ -38,7 +40,13 @@ if [ -f /run/warp-optip/self-up ]; then
     fi
 fi
 
-timeout --signal=TERM --kill-after=5s "${WARP_PREUP_TIMEOUT:-25}s" \
+# 引擎内部按同一个预算自行收敛（超时了就带着已有结论返回），
+# 这里的 timeout 只是最后一道保险，多给 10 秒余量，
+# 免得把正在进行的最后一轮实测从中间掐断。
+preup_timeout=${WARP_PREUP_TIMEOUT:-60}
+case "$preup_timeout" in ''|*[!0-9]*) preup_timeout=60 ;; esac
+
+timeout --signal=TERM --kill-after=5s "$(( preup_timeout + 10 ))s" \
     /usr/local/bin/warp-optip pre-up \
     >> /run/warp-optip/pre-up.log 2>&1
 
