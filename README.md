@@ -2,9 +2,9 @@
 
 WARP Endpoint 自动优选工具。
 
-- 在 NetworkManager **pre-up** 阶段（正在连接时）同步扫描并设置优选 endpoint。
-- up 之后异步校验 `warp=on`，失败自动换下一个候选。
-- 默认 `keep`：当前 endpoint 健康就不换 IP、不扫描、不断网。
+- 在 NetworkManager **pre-up** 阶段（正在连接时）同步扫描生成候选列表并设置优选 endpoint。
+- up 之后异步校验 `warp=on`，失败则用候选逐个实测换下一个。
+- 扫描只发生在 pre-up；verify 不会为了扫描断开已有连接，用户主动断开时 verify 立即中止。
 - 首次安装会新建独立连接（默认 `warp-optip`），**不修改现有 `wgcf-profile`**。
 
 ## 原理
@@ -17,7 +17,7 @@ NetworkManager: 正在连接（pending）
         │
         ▼
 pre-up.d/90-warp-optip   （同步，最多 25 秒）
-        ├─ 首次/缓存缺失：直连扫描
+        ├─ 每次 up 都直连扫描，生成候选列表
         ├─ 选候选
         ├─ wg set <iface> peer <pub> endpoint IP:PORT
         └─ 返回
@@ -27,11 +27,12 @@ NetworkManager 完成激活
         │
         ▼
 dispatcher.d/90-warp-optip-verify（异步）
-        └─ warp-optip.service verify
-             ├─ 持久化 endpoint 到 NM profile
-             ├─ 连续 3 次检查 warp=on
-             ├─ 失败：用结果候选修复
-             └─ 全失败：恢复旧 endpoint；再失败则断开 WARP
+        ├─ action=up   -> warp-optip.service verify
+        │                    ├─ 持久化 endpoint 到 NM profile
+        │                    ├─ 连续 3 次检查 warp=on
+        │                    ├─ 失败：用 pre-up 生成的候选逐个实测（不再扫描）
+        │                    └─ 全失败：恢复旧 endpoint；再失败则断开 WARP
+        └─ action=down -> systemctl stop（用户主动断开时中止修复）
 ```
 
 pre-up 阶段**不能**调用 `nmcli connection up/down/modify`，否则可能和 NetworkManager
@@ -141,9 +142,13 @@ nmcli connection down warp-optip
 
 每次 up：
 
-- 当前 endpoint 健康：只检查，不换 IP、不扫描、不断网。
-- 当前 endpoint 不健康：优先用缓存候选修复；缓存过期或全失败才全量扫描。
+- pre-up 阶段无条件直连扫描，生成新的候选列表（最多 25 秒，图标显示“正在连接”）。
+- 当前 endpoint 健康：verify 只确认 `warp=on`，不换 IP、不断网。
+- 当前 endpoint 不健康：用本次扫描出的候选逐个实测，直到连通；verify 不会重新扫描。
 - 全部失败：恢复旧 endpoint；旧 endpoint 也不行则断开 WARP，保证物理网络可用。
+- 用户在 verify 期间主动断开：服务被 `systemctl stop` 终止，不会把隧道重新打开。
+
+> 扫描失败时 `result.csv` 保持上一次成功扫描的内容不变，verify 仍能拿到候选列表。
 
 ### 手动命令
 
@@ -190,7 +195,6 @@ WARP_MAX_LATENCY=200
 WARP_LIMIT=20
 
 WARP_ON_UP_POLICY=keep
-WARP_CACHE_MAX_AGE=21600
 
 WARP_PHYSICAL_CHECK_URL=https://www.baidu.com
 WARP_CHECK_URL=https://1.1.1.1/cdn-cgi/trace
@@ -231,6 +235,7 @@ cat /run/warp-optip/dispatcher.log
 ```text
 pre-up-hook action=pre-up id=warp-optip type= iface=warp-optip
 verify-hook action=up id=warp-optip type= iface=warp-optip
+verify-hook action=down id=warp-optip type= iface=warp-optip
 ```
 
 注意：部分 NetworkManager 版本不会设置 `CONNECTION_TYPE`，所以 `type=` 为空是正常的。
@@ -256,9 +261,10 @@ action="${NM_DISPATCHER_ACTION:-${1:-}}"
 如果旧版本安装的脚本里写的是 `[ "$ACTION" = ... ]`，重新运行
 `sudo ./install.sh` 更新 Dispatcher。
 
-### 首次 up 卡很久
+### up 时“正在连接”很久
 
-pre-up 最多等 25 秒；超过会放弃扫描并让连接正常起来。
+每次 up 的 pre-up 都会扫描，最多等 25 秒；超过会放弃扫描并让连接正常起来，
+verify 阶段改用上一次成功扫描的候选列表。
 看：
 
 ```bash
@@ -278,7 +284,7 @@ sudo journalctl -u NetworkManager -n 100 --no-pager
 
 ### 当前 IP 不健康但不换
 
-默认策略是 `keep`，只在 verify 检测到 `warp=on` 失败时才修复。
+只有 verify 实测 `warp=on` 失败才会切换候选；endpoint 实测通过就保留。
 强制重新优选：
 
 ```bash

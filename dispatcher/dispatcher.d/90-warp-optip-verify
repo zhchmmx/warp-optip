@@ -1,7 +1,8 @@
 #!/bin/sh
 #
-# WARP 优选 up 后校验钩子（异步）
+# WARP 优选校验钩子（异步）
 # 安装到 /etc/NetworkManager/dispatcher.d/90-warp-optip-verify
+# up 时启动校验/修复服务，down 时终止它。
 #
 
 [ -f /etc/warp-optip.conf ] || exit 0
@@ -14,7 +15,11 @@ echo "[$(date '+%F %T')] verify-hook action=${NM_DISPATCHER_ACTION:-${1:-}} id=$
 # NetworkManager 提供的是 NM_DISPATCHER_ACTION（新版本），
 # 同时兼容历史上用 $1 传 action 的调用方式。
 action="${NM_DISPATCHER_ACTION:-${1:-}}"
-[ "$action" = "up" ] || exit 0
+
+case "$action" in
+    up | down | pre-down) ;;
+    *) exit 0 ;;
+esac
 
 # 部分 NetworkManager 版本不会设置 CONNECTION_TYPE（为空）。
 # 连接名已经足够唯一，这里只在 type 有值时做一次过滤。
@@ -23,17 +28,29 @@ if [ -n "${CONNECTION_TYPE:-}" ] && [ "$CONNECTION_TYPE" != "wireguard" ]; then
 fi
 [ "$CONNECTION_ID" = "${WARP_CONN:-warp-optip}" ] || exit 0
 
-# 服务正在运行时不重复启动
-systemctl is-active --quiet warp-optip.service && exit 0
-
-# 服务自己触发的 up 不递归
+# 服务自己触发的重连会成对出现 down/up，用 self-up 标记识别，
+# 既不递归启动校验，也不把正在运行的服务杀掉。
+self_up=0
 if [ -f /run/warp-optip/self-up ]; then
     now=$(date +%s)
     ts=$(cat /run/warp-optip/self-up 2>/dev/null || echo 0)
     if [ $((now - ts)) -lt 60 ]; then
-        rm -f /run/warp-optip/self-up
-        exit 0
+        self_up=1
     fi
+fi
+
+if [ "$action" != "up" ]; then
+    # 用户主动断开：终止正在进行的校验/修复，
+    # 否则它下一轮候选尝试会把隧道重新打开。
+    [ "$self_up" -eq 1 ] && exit 0
+    systemctl stop --no-block warp-optip.service
+    exit 0
+fi
+
+# up：服务自己触发的不递归
+if [ "$self_up" -eq 1 ]; then
+    rm -f /run/warp-optip/self-up
+    exit 0
 fi
 
 systemctl start --no-block warp-optip.service

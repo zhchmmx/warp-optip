@@ -28,7 +28,6 @@ WARP_MAX_LOSS="${WARP_MAX_LOSS:-20}"
 WARP_MAX_LATENCY="${WARP_MAX_LATENCY:-200}"
 WARP_LIMIT="${WARP_LIMIT:-20}"
 WARP_ON_UP_POLICY="${WARP_ON_UP_POLICY:-keep}"
-WARP_CACHE_MAX_AGE="${WARP_CACHE_MAX_AGE:-21600}"
 WARP_PHYSICAL_CHECK_URL="${WARP_PHYSICAL_CHECK_URL:-https://www.baidu.com}"
 WARP_CHECK_URL="${WARP_CHECK_URL:-https://1.1.1.1/cdn-cgi/trace}"
 WARP_SCAN_TIMEOUT="${WARP_SCAN_TIMEOUT:-18}"
@@ -39,12 +38,10 @@ RUN_DIR="/run/warp-optip"
 LAST_ENDPOINT_FILE="$WARP_STATE_DIR/last-endpoint"
 OLD_ENDPOINT_FILE="$WARP_STATE_DIR/old-endpoint"
 PENDING_ENDPOINT_FILE="$WARP_STATE_DIR/pending-endpoint"
-SCAN_TIME_FILE="$WARP_STATE_DIR/scan-time"
 DISABLED_FILE="$WARP_STATE_DIR/disabled"
 
 IFACE="${DEVICE_IFACE:-$WARP_IFACE}"
 
-ADDED_RULES=""
 SCAN_CHILD=""
 
 # ---------- 基础工具 ----------
@@ -168,15 +165,6 @@ parse_candidates() {
     ' "$file" | sort -t $'\t' -k2,2n | awk -F'\t' '!seen[$1]++'
 }
 
-cache_fresh() {
-    local now ts
-    [[ -s "$SCAN_TIME_FILE" ]] || return 1
-    now=$(date +%s)
-    ts=$(cat "$SCAN_TIME_FILE" 2>/dev/null || echo 0)
-    [[ "$ts" =~ ^[0-9]+$ ]] || return 1
-    (( now - ts <= WARP_CACHE_MAX_AGE ))
-}
-
 pick_candidate() {
     local cur="$1" cur_ip first fallback
     cur_ip=""
@@ -195,30 +183,7 @@ pick_candidate() {
 
 # ---------- 直连扫描 ----------
 
-add_bypass_rules() {
-    local cidr
-    [[ -n "$ADDED_RULES" ]] && return 0
-    for cidr in ${WARP_SCAN_RANGES//,/ }; do
-        [[ -n "$cidr" ]] || continue
-        if ip rule add priority 100 to "$cidr" lookup 254 2>/dev/null; then
-            ADDED_RULES+="$cidr"$'\n'
-            log "临时旁路规则: $cidr -> main"
-        fi
-    done
-}
-
-cleanup_bypass_rules() {
-    local cidr
-    while IFS= read -r cidr; do
-        [[ -n "$cidr" ]] || continue
-        ip rule del priority 100 to "$cidr" lookup 254 2>/dev/null || true
-        log "移除临时旁路规则: $cidr"
-    done <<< "$ADDED_RULES"
-    ADDED_RULES=""
-}
-
 cleanup_all() {
-    cleanup_bypass_rules
     if [[ -n "$SCAN_CHILD" ]] && kill -0 "$SCAN_CHILD" 2>/dev/null; then
         kill "$SCAN_CHILD" 2>/dev/null || true
     fi
@@ -239,9 +204,6 @@ scan_direct() {
     local tmp rc
 
     [[ -x "$WARP_SCAN_BIN" ]] || { log "扫描器不存在: $WARP_SCAN_BIN"; return 1; }
-
-    # 先加旁路规则，再检查物理网络；pre-up 阶段默认路由可能还没切回物理网
-    add_bypass_rules
 
     if ! ensure_physical_network; then
         log "物理网络检查失败，仍尝试扫描（可能是 pre-up 阶段路由尚未切换）"
@@ -264,7 +226,6 @@ scan_direct() {
     wait "$SCAN_CHILD"
     rc=$?
     SCAN_CHILD=""
-    cleanup_bypass_rules
 
     if [[ "$rc" -ne 0 ]]; then
         log "扫描器退出码: $rc"
@@ -282,7 +243,6 @@ scan_direct() {
         cp -f "$WARP_RESULT_CSV" "$WARP_RESULT_CSV.bak" 2>/dev/null || true
     fi
     mv -f "$tmp" "$WARP_RESULT_CSV"
-    date +%s > "$SCAN_TIME_FILE"
     log "扫描完成: $WARP_RESULT_CSV"
     return 0
 }
@@ -313,32 +273,17 @@ pre_up() {
     local iface="${DEVICE_IFACE:-$IFACE}"
     local cur_ep pub ep
 
-    if [[ "$WARP_ON_UP_POLICY" == "keep" ]] \
-        && [[ -s "$LAST_ENDPOINT_FILE" ]]; then
-        log "pre-up: 策略为 keep 且已有 last-endpoint，保留当前 endpoint"
-        return 0
-    fi
-
     cur_ep="$(wg_peer_endpoint "$iface")"
     pub="$(wg_peer_pubkey "$iface")"
 
     [[ -n "$cur_ep" ]] && printf '%s\n' "$cur_ep" > "$OLD_ENDPOINT_FILE"
 
-    ep=""
-    if [[ "$WARP_ON_UP_POLICY" == "rotate" ]] \
-        && [[ -s "$WARP_RESULT_CSV" ]] \
-        && cache_fresh; then
-        ep="$(pick_candidate "$cur_ep")"
-        log "pre-up: 从缓存选择 $ep"
+    if ! scan_direct; then
+        log "pre-up: 扫描失败，保持当前 endpoint"
+        return 0
     fi
 
-    if [[ -z "$ep" ]]; then
-        if ! scan_direct; then
-            log "pre-up: 扫描失败，保持当前 endpoint"
-            return 0
-        fi
-        ep="$(pick_candidate "$cur_ep")"
-    fi
+    ep="$(pick_candidate "$cur_ep")"
 
     if [[ -z "$ep" ]]; then
         log "pre-up: 没有可用候选"
@@ -416,6 +361,11 @@ try_candidates() {
     while IFS=$'\t' read -r ep lat; do
         [[ -n "$ep" ]] || continue
         [[ -n "$exclude" && "$ep" == "$exclude" ]] && continue
+        # 用户已主动断开时立即中止，不能把隧道重新打开
+        if ! warp_is_active; then
+            log "候选尝试中止：$WARP_CONN 已不再激活"
+            return 1
+        fi
         if try_endpoint "$ep"; then
             printf '%s\n' "$ep" > "$LAST_ENDPOINT_FILE"
             return 0
@@ -482,21 +432,11 @@ verify_mode() {
         log "verify: 当前 endpoint 不健康，开始尝试候选"
     fi
 
-    if [[ -s "$WARP_RESULT_CSV" ]] && cache_fresh; then
+    if [[ -s "$WARP_RESULT_CSV" ]]; then
         if try_candidates "$cur_ep"; then
             rm -f "$PENDING_ENDPOINT_FILE" 2>/dev/null || true
             log "verify: 候选切换成功"
             return 0
-        fi
-    else
-        log "verify: 缓存不存在或已过期，执行一次全量扫描"
-        nmcli --wait 15 connection down "$WARP_CONN" >/dev/null 2>&1 || true
-        if scan_direct; then
-            if try_candidates "$cur_ep"; then
-                rm -f "$PENDING_ENDPOINT_FILE" 2>/dev/null || true
-                log "verify: 扫描后切换成功"
-                return 0
-            fi
         fi
     fi
 
@@ -579,11 +519,6 @@ status_cmd() {
     echo "endpoint   : $(nmcli_endpoint 2>/dev/null || echo 未知)"
     echo "last       : $(cat "$LAST_ENDPOINT_FILE" 2>/dev/null || echo 无)"
     echo "pending    : $(cat "$PENDING_ENDPOINT_FILE" 2>/dev/null || echo 无)"
-    if [[ -s "$SCAN_TIME_FILE" ]]; then
-        echo "scan-time  : $(date -d "@$(cat "$SCAN_TIME_FILE")" '+%F %T' 2>/dev/null || echo 无)"
-    else
-        echo "scan-time  : 无"
-    fi
     local n
     n=$(parse_candidates "$WARP_RESULT_CSV" 2>/dev/null | wc -l)
     echo "candidates : $n"
