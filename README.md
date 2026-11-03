@@ -2,9 +2,11 @@
 
 WARP Endpoint 自动优选工具。
 
-- 在 NetworkManager **pre-up** 阶段（正在连接时）同步扫描并设置优选 endpoint。
-- up 之后异步校验 `warp=on`，失败自动换下一个候选。
-- 默认 `keep`：当前 endpoint 健康就不换 IP、不扫描、不断网。
+- 在 NetworkManager **pre-up** 阶段（正在连接时）同步扫描生成候选列表并设置优选 endpoint。
+- 扫描期间用临时 `ip rule` 把探测流量压回物理网络，避免被 WireGuard 策略路由带进隧道。
+- up 之后异步校验 `warp=on`，失败则用候选逐个实测换下一个。
+- 扫描只发生在 pre-up；verify 不会为了扫描断开已有连接，用户主动断开时 verify 立即中止。
+- 程序全程不执行 `nmcli connection up`：隧道只可能由用户打开，因此一定关得掉。
 - 首次安装会新建独立连接（默认 `warp-optip`），**不修改现有 `wgcf-profile`**。
 
 ## 原理
@@ -17,7 +19,9 @@ NetworkManager: 正在连接（pending）
         │
         ▼
 pre-up.d/90-warp-optip   （同步，最多 25 秒）
-        ├─ 首次/缓存缺失：直连扫描
+        ├─ 临时 ip rule：扫描网段强制走物理表（main）
+        ├─ 每次 up 都直连扫描，生成候选列表（只传 -ip/-o，并发用扫描器内置默认）
+        ├─ 删除临时 ip rule
         ├─ 选候选
         ├─ wg set <iface> peer <pub> endpoint IP:PORT
         └─ 返回
@@ -27,22 +31,30 @@ NetworkManager 完成激活
         │
         ▼
 dispatcher.d/90-warp-optip-verify（异步）
-        └─ warp-optip.service verify
-             ├─ 持久化 endpoint 到 NM profile
-             ├─ 连续 3 次检查 warp=on
-             ├─ 失败：用结果候选修复
-             └─ 全失败：恢复旧 endpoint；再失败则断开 WARP
+        ├─ action=up   -> warp-optip.service verify
+        │                    ├─ 持久化 endpoint 到 NM profile
+        │                    ├─ 检查 warp=on（单次，curl 上限 10 秒）
+        │                    ├─ 失败：用 pre-up 生成的候选逐个实测（不再扫描）
+        │                    └─ 全失败：恢复旧 endpoint；再失败则断开 WARP
+        └─ action=down -> systemctl stop（用户主动断开时中止修复）
 ```
 
 pre-up 阶段**不能**调用 `nmcli connection up/down/modify`，否则可能和 NetworkManager
 死锁。因此 pre-up 只用 `wg set` 改运行时 endpoint；`nmcli` 操作全部放在 up 后的
 verify 阶段。
 
+另外，NetworkManager 会在激活开始后几百毫秒内装好 WireGuard 的自动默认路由
+（`ip rule ... lookup 52289` + fwmark），此时扫描流量会被带进隧道，测到的就不是
+物理网络的可达性。所以扫描前会临时插入一条优先级更高的 `ip rule`，把目标为
+`WARP_SCAN_RANGES` 的流量压回 `main` 表（物理默认路由），扫描结束后立即删除。
+这只会影响扫描网段，宿主其它流量仍走隧道。
+
 ## 依赖
 
-- Linux + NetworkManager（支持原生 WireGuard）
-- `nmcli`、`systemctl`、`curl`、`awk`、`flock`、`timeout`、`wg`
+- Linux + NetworkManager >= 1.12（支持原生 WireGuard 和 `nmcli device reapply`）
+- `nmcli`、`ip`、`systemctl`、`curl`、`awk`、`flock`、`timeout`、`wg`
 - root/sudo
+- 桌面通知可选：优先 `notify-send`（libnotify），没有时退回 glib2 自带的 `gdbus`
 - 首次注册需要访问 Cloudflare API；下载二进制需要网络（或本地提供）
 
 ## 安装
@@ -122,7 +134,7 @@ nmcli connection up warp-optip
 - 图标显示“正在连接”；
 - pre-up 阶段直连扫描（约 5~30 秒）；
 - 用 `wg set` 设置优选 endpoint；
-- 激活后 verify 阶段连续检查 `warp=on`；
+- 激活后 verify 阶段检查 `warp=on`；
 - 成功后写入 `last-endpoint`。
 
 验证：
@@ -141,9 +153,14 @@ nmcli connection down warp-optip
 
 每次 up：
 
-- 当前 endpoint 健康：只检查，不换 IP、不扫描、不断网。
-- 当前 endpoint 不健康：优先用缓存候选修复；缓存过期或全失败才全量扫描。
+- pre-up 阶段无条件直连扫描，生成新的候选列表（最多 25 秒，图标显示“正在连接”）。
+  扫描期间探测流量被临时规则压回物理网络，不会走当前隧道。
+- 当前 endpoint 健康：verify 只确认 `warp=on`，不换 IP、不断网。
+- 当前 endpoint 不健康：用本次扫描出的候选逐个实测，直到连通；verify 不会重新扫描。
 - 全部失败：恢复旧 endpoint；旧 endpoint 也不行则断开 WARP，保证物理网络可用。
+- 用户在 verify 期间主动断开：服务被 `systemctl stop` 终止，不会把隧道重新打开。
+
+> 扫描失败时 `result.csv` 保持上一次成功扫描的内容不变，verify 仍能拿到候选列表。
 
 ### 手动命令
 
@@ -173,6 +190,30 @@ sudo tail -f /var/lib/warp-optip/warp-optip.log
 tail -f /run/warp-optip/pre-up.log
 ```
 
+### 桌面通知
+
+`verify` 走到最终结论时发一条系统通知，之后就可以不看日志：
+
+- `warp=on` 通过：`WARP 已连通`，正文带当前 endpoint
+- 所有候选和原 endpoint 都不通、已断开隧道退回物理网络：`WARP 无法连通`
+
+通知由 root 的 systemd 服务发出，但**不是**以 root 身份发：桌面通知走登录用户
+自己的 D-Bus session bus（`/run/user/<uid>/bus`），而 D-Bus 用 `SO_PEERCRED`
+校验连接方的 uid，uid 对不上连接会被直接关掉。所以代码先 `runuser -u <用户>`
+降权、再带上该用户的总线地址发送。`DISPLAY`/`XAUTHORITY`/`WAYLAND_DISPLAY`
+在这条链路上都不需要。
+
+接收者默认取「当前有登录会话的用户」（`loginctl`，取不到时扫 `/run/user/*/bus`），
+多用户或自动登录场景可以在配置里写死 `WARP_NOTIFY_USER`。
+
+安装器**不会**为通知安装同名 `.desktop`。GNOME 会按 `app_name` 反查应用；
+一旦解析成功，通知就会绑定到 `notify-send`/`gdbus` 的临时 D-Bus 连接上，
+进程退出后 GNOME 会销毁整个通知源，连通知面板里的记录都会消失。保持解析
+不到应用（generic source）才能让通知留在面板里。
+
+这是纯附加功能：没人登录、没装通知工具、GNOME 开了免打扰，都只会静默跳过，
+每条外部命令都带超时，不会拖慢 `verify`。日志里出现 `通知未送达` 说明当时没发出去。
+
 ## 配置
 
 `/etc/warp-optip.conf`：
@@ -190,13 +231,24 @@ WARP_MAX_LATENCY=200
 WARP_LIMIT=20
 
 WARP_ON_UP_POLICY=keep
-WARP_CACHE_MAX_AGE=21600
 
-WARP_PHYSICAL_CHECK_URL=https://www.baidu.com
 WARP_CHECK_URL=https://1.1.1.1/cdn-cgi/trace
 
 WARP_SCAN_TIMEOUT=18
 WARP_PREUP_TIMEOUT=25
+
+# 扫描时强制走物理网络（pre-up 阶段 NM 已装好 WG 策略路由）
+# NM 的规则优先级由连接 UUID 派生，范围 30768~31766，这里必须更小
+WARP_SCAN_FORCE_PHYSICAL=1
+WARP_SCAN_RULE_PREF=30000
+# 只用于日志：验证扫描流量实际走物理网关
+WARP_SCAN_PROBE_IP=162.159.192.1
+
+# 桌面通知：1 开启 / 0 关闭；留空用户名表示自动选当前登录会话的用户
+WARP_NOTIFY=1
+WARP_NOTIFY_USER=
+WARP_NOTIFY_DEDUPE=60
+WARP_NOTIFY_TIMEOUT=3
 ```
 
 ## 卸载
@@ -231,6 +283,7 @@ cat /run/warp-optip/dispatcher.log
 ```text
 pre-up-hook action=pre-up id=warp-optip type= iface=warp-optip
 verify-hook action=up id=warp-optip type= iface=warp-optip
+verify-hook action=down id=warp-optip type= iface=warp-optip
 ```
 
 注意：部分 NetworkManager 版本不会设置 `CONNECTION_TYPE`，所以 `type=` 为空是正常的。
@@ -256,9 +309,10 @@ action="${NM_DISPATCHER_ACTION:-${1:-}}"
 如果旧版本安装的脚本里写的是 `[ "$ACTION" = ... ]`，重新运行
 `sudo ./install.sh` 更新 Dispatcher。
 
-### 首次 up 卡很久
+### up 时“正在连接”很久
 
-pre-up 最多等 25 秒；超过会放弃扫描并让连接正常起来。
+每次 up 的 pre-up 都会扫描，最多等 25 秒；超过会放弃扫描并让连接正常起来，
+verify 阶段改用上一次成功扫描的候选列表。
 看：
 
 ```bash
@@ -273,12 +327,13 @@ tail -n 100 /run/warp-optip/pre-up.log
 sudo journalctl -u NetworkManager -n 100 --no-pager
 ```
 
-若 NetworkManager 在 pre-up 后覆盖了运行时 endpoint，verify 阶段会再 `reapply` 一次；
-仍然不行则回退到 `nmcli connection up`。
+若 NetworkManager 在 pre-up 后覆盖了运行时 endpoint，verify 阶段会用
+`nmcli connection modify` + `nmcli device reapply` 重新应用配置。程序本身不执行
+`nmcli connection up`，所以隧道只可能由用户打开。
 
 ### 当前 IP 不健康但不换
 
-默认策略是 `keep`，只在 verify 检测到 `warp=on` 失败时才修复。
+只有 verify 实测 `warp=on` 失败才会切换候选；endpoint 实测通过就保留。
 强制重新优选：
 
 ```bash

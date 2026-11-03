@@ -28,24 +28,50 @@ WARP_MAX_LOSS="${WARP_MAX_LOSS:-20}"
 WARP_MAX_LATENCY="${WARP_MAX_LATENCY:-200}"
 WARP_LIMIT="${WARP_LIMIT:-20}"
 WARP_ON_UP_POLICY="${WARP_ON_UP_POLICY:-keep}"
-WARP_CACHE_MAX_AGE="${WARP_CACHE_MAX_AGE:-21600}"
-WARP_PHYSICAL_CHECK_URL="${WARP_PHYSICAL_CHECK_URL:-https://www.baidu.com}"
 WARP_CHECK_URL="${WARP_CHECK_URL:-https://1.1.1.1/cdn-cgi/trace}"
 WARP_SCAN_TIMEOUT="${WARP_SCAN_TIMEOUT:-18}"
 WARP_PREUP_TIMEOUT="${WARP_PREUP_TIMEOUT:-25}"
+
+# 扫描时强制走物理网络：pre-up 阶段 NM 会很快装好 WireGuard 的策略路由，
+# 不强制的话探测会进隧道。规则只匹配扫描网段，扫完即删。
+WARP_SCAN_FORCE_PHYSICAL="${WARP_SCAN_FORCE_PHYSICAL:-1}"
+WARP_SCAN_RULE_PREF="${WARP_SCAN_RULE_PREF:-30000}"
+WARP_SCAN_PROBE_IP="${WARP_SCAN_PROBE_IP:-162.159.192.1}"
+
+# NetworkManager 给 WireGuard 自动默认路由选的规则优先级由连接 UUID 派生，
+# 范围是 30768~31766 的偶数。扫描规则必须比它更小才能先命中；
+# 旧配置里的 31000 会随机失效，这里统一钳制到安全值。
+SCAN_RULE_PREF_CLAMPED=""
+if [[ ! "$WARP_SCAN_RULE_PREF" =~ ^[0-9]+$ ]] \
+    || (( 10#$WARP_SCAN_RULE_PREF < 1 )) \
+    || (( 10#$WARP_SCAN_RULE_PREF >= 30768 )); then
+    SCAN_RULE_PREF_CLAMPED="$WARP_SCAN_RULE_PREF"
+    WARP_SCAN_RULE_PREF=30000
+fi
 
 LOG_FILE="$WARP_STATE_DIR/warp-optip.log"
 RUN_DIR="/run/warp-optip"
 LAST_ENDPOINT_FILE="$WARP_STATE_DIR/last-endpoint"
 OLD_ENDPOINT_FILE="$WARP_STATE_DIR/old-endpoint"
 PENDING_ENDPOINT_FILE="$WARP_STATE_DIR/pending-endpoint"
-SCAN_TIME_FILE="$WARP_STATE_DIR/scan-time"
 DISABLED_FILE="$WARP_STATE_DIR/disabled"
+
+# ---------- 通知（可选模块） ----------
+#
+# 单独一个文件，并且允许它不存在：通知只是锦上添花，读不到、执行失败、
+# 目标机器没装 notify-send，都不能影响连接和扫描。所以先定义空函数兜底，
+# 再判断可读才 source。
+warp_notify() { return 0; }
+NOTIFY_LIB="${WARP_NOTIFY_LIB:-$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)/warp-optip-notify.sh}"
+if [[ -r "$NOTIFY_LIB" ]]; then
+    # shellcheck disable=SC1090
+    . "$NOTIFY_LIB"
+fi
 
 IFACE="${DEVICE_IFACE:-$WARP_IFACE}"
 
-ADDED_RULES=""
 SCAN_CHILD=""
+SCAN_RULES_ACTIVE=0
 
 # ---------- 基础工具 ----------
 
@@ -97,12 +123,8 @@ warp_is_active() {
 
 verify_warp() {
     local out
-    local i
-    for i in 1 2 3; do
-        out="$(curl -sS --max-time 8 "$WARP_CHECK_URL" 2>/dev/null)" || return 1
-        grep -qx 'warp=on' <<<"$out" || return 1
-        sleep 2
-    done
+    out="$(curl -sS --connect-timeout 5 --max-time 10 "$WARP_CHECK_URL" 2>/dev/null)" || return 1
+    grep -qx 'warp=on' <<<"$out" || return 1
     return 0
 }
 
@@ -168,15 +190,6 @@ parse_candidates() {
     ' "$file" | sort -t $'\t' -k2,2n | awk -F'\t' '!seen[$1]++'
 }
 
-cache_fresh() {
-    local now ts
-    [[ -s "$SCAN_TIME_FILE" ]] || return 1
-    now=$(date +%s)
-    ts=$(cat "$SCAN_TIME_FILE" 2>/dev/null || echo 0)
-    [[ "$ts" =~ ^[0-9]+$ ]] || return 1
-    (( now - ts <= WARP_CACHE_MAX_AGE ))
-}
-
 pick_candidate() {
     local cur="$1" cur_ip first fallback
     cur_ip=""
@@ -195,30 +208,86 @@ pick_candidate() {
 
 # ---------- 直连扫描 ----------
 
-add_bypass_rules() {
-    local cidr
-    [[ -n "$ADDED_RULES" ]] && return 0
-    for cidr in ${WARP_SCAN_RANGES//,/ }; do
-        [[ -n "$cidr" ]] || continue
-        if ip rule add priority 100 to "$cidr" lookup 254 2>/dev/null; then
-            ADDED_RULES+="$cidr"$'\n'
-            log "临时旁路规则: $cidr -> main"
-        fi
+# 扫描期间把目标为扫描网段的流量压回 main 表（物理默认路由）。
+#
+# NetworkManager 给 WireGuard 自动装好的规则大致是：
+#   31444: from all lookup main suppress_prefixlength 0
+#   31445: not from all fwmark 0xcc41 lookup 52289
+# 31444 对所有流量生效，所以只给探测包打 fwmark 不够；必须在它之前
+# （更小的 pref）插一条只匹配扫描网段的规则，让探测查 main 表。
+# 规则扫完即删，不影响宿主其它流量，也不影响 wg 自己的握手包。
+scan_rules_flush() {
+    command -v ip >/dev/null 2>&1 || return 0
+    local -a ranges
+    IFS=, read -r -a ranges <<< "$WARP_SCAN_RANGES"
+    local r
+    for r in "${ranges[@]}"; do
+        r="${r//[[:space:]]/}"
+        [[ -n "$r" ]] || continue
+        while ip -4 rule del pref "$WARP_SCAN_RULE_PREF" to "$r" lookup main 2>/dev/null; do
+            :
+        done
     done
 }
 
-cleanup_bypass_rules() {
-    local cidr
-    while IFS= read -r cidr; do
-        [[ -n "$cidr" ]] || continue
-        ip rule del priority 100 to "$cidr" lookup 254 2>/dev/null || true
-        log "移除临时旁路规则: $cidr"
-    done <<< "$ADDED_RULES"
-    ADDED_RULES=""
+scan_rules_remove() {
+    [[ "$SCAN_RULES_ACTIVE" -eq 1 ]] || return 0
+    scan_rules_flush
+    SCAN_RULES_ACTIVE=0
+}
+
+scan_rules_add() {
+    [[ "$WARP_SCAN_FORCE_PHYSICAL" == "1" ]] || return 0
+
+    if [[ "$(id -u)" -ne 0 ]]; then
+        log "扫描出口: 非 root，无法强制物理网络（扫描继续）"
+        return 1
+    fi
+    command -v ip >/dev/null 2>&1 || { log "扫描出口: 缺少 ip 命令"; return 1; }
+
+    # 清掉上次异常退出可能残留的规则
+    scan_rules_flush
+
+    local -a ranges
+    IFS=, read -r -a ranges <<< "$WARP_SCAN_RANGES"
+    local r n=0
+    for r in "${ranges[@]}"; do
+        r="${r//[[:space:]]/}"
+        [[ -n "$r" ]] || continue
+        if ip -4 rule add pref "$WARP_SCAN_RULE_PREF" to "$r" lookup main 2>/dev/null; then
+            n=$((n + 1))
+        else
+            log "扫描出口: 添加规则失败 to $r"
+        fi
+    done
+
+    if [[ "$n" -gt 0 ]]; then
+        SCAN_RULES_ACTIVE=1
+        if [[ -n "$SCAN_RULE_PREF_CLAMPED" ]]; then
+            log "扫描出口: 配置的 pref $SCAN_RULE_PREF_CLAMPED 不安全，改用 $WARP_SCAN_RULE_PREF（NM 的规则可能低到 30768）"
+        fi
+        log "扫描出口: 已强制 $n 个网段走物理网络 (pref $WARP_SCAN_RULE_PREF)"
+        if [[ -n "$WARP_SCAN_PROBE_IP" ]]; then
+            local route
+            route="$(ip route get "$WARP_SCAN_PROBE_IP" 2>&1 | head -n1)"
+            log "扫描出口: $route"
+            if [[ "$route" == *" dev ${WARP_IFACE} "* || "$route" == *" table "* ]]; then
+                log "扫描出口: 警告，探测仍可能走隧道；当前规则:"
+                ip -4 rule show 2>/dev/null | while IFS= read -r line; do
+                    log "  $line"
+                done
+            fi
+        fi
+        return 0
+    fi
+
+    log "扫描出口: 没有添加任何规则，探测可能仍走隧道"
+    return 1
 }
 
 cleanup_all() {
-    cleanup_bypass_rules
+    scan_rules_remove
+    rm -f "$RUN_DIR/self-up" 2>/dev/null || true
     if [[ -n "$SCAN_CHILD" ]] && kill -0 "$SCAN_CHILD" 2>/dev/null; then
         kill "$SCAN_CHILD" 2>/dev/null || true
     fi
@@ -226,45 +295,36 @@ cleanup_all() {
 
 trap cleanup_all EXIT INT TERM
 
-ensure_physical_network() {
-    log "检查物理网络: $WARP_PHYSICAL_CHECK_URL"
-    if ! curl -sS --max-time 8 -o /dev/null "$WARP_PHYSICAL_CHECK_URL" 2>/dev/null; then
-        log "物理网络检查失败"
-        return 1
-    fi
-    return 0
-}
-
 scan_direct() {
     local tmp rc
 
     [[ -x "$WARP_SCAN_BIN" ]] || { log "扫描器不存在: $WARP_SCAN_BIN"; return 1; }
 
-    # 先加旁路规则，再检查物理网络；pre-up 阶段默认路由可能还没切回物理网
-    add_bypass_rules
-
-    if ! ensure_physical_network; then
-        log "物理网络检查失败，仍尝试扫描（可能是 pre-up 阶段路由尚未切换）"
-    fi
-
     tmp="$WARP_RESULT_CSV.new.$$"
     rm -f "$tmp"
 
     log "开始扫描: $WARP_SCAN_RANGES"
+
+    # 让探测流量绕过可能已经生效的 WireGuard 策略路由
+    scan_rules_add || true
+
+    # 与上游 warp-yxip.sh 保持一致：它除了 -ip/-o 之外不传任何参数，
+    # 并发和筛选全用内置默认；并且先把 fd 上限抬到 102400。
+    # 之前我们传的 -t 2 把并发压成 2，1792 个地址在 18 秒内根本测不完，
+    # 结果全是 timeout 行，解析后候选数为 0。
+    ulimit -n 102400 2>/dev/null || true
+
     timeout --signal=TERM --kill-after=2s "${WARP_SCAN_TIMEOUT}s" \
         "$WARP_SCAN_BIN" \
         -ip "$WARP_SCAN_RANGES" \
-        -t 2 \
-        -tl "$WARP_MAX_LATENCY" \
-        -tlr 0.2 \
-        -n 200 \
-        -p 20 \
         -o "$tmp" &
     SCAN_CHILD=$!
     wait "$SCAN_CHILD"
     rc=$?
     SCAN_CHILD=""
-    cleanup_bypass_rules
+
+    # 探测结束立刻恢复系统路由，不等脚本退出
+    scan_rules_remove
 
     if [[ "$rc" -ne 0 ]]; then
         log "扫描器退出码: $rc"
@@ -282,7 +342,6 @@ scan_direct() {
         cp -f "$WARP_RESULT_CSV" "$WARP_RESULT_CSV.bak" 2>/dev/null || true
     fi
     mv -f "$tmp" "$WARP_RESULT_CSV"
-    date +%s > "$SCAN_TIME_FILE"
     log "扫描完成: $WARP_RESULT_CSV"
     return 0
 }
@@ -313,32 +372,17 @@ pre_up() {
     local iface="${DEVICE_IFACE:-$IFACE}"
     local cur_ep pub ep
 
-    if [[ "$WARP_ON_UP_POLICY" == "keep" ]] \
-        && [[ -s "$LAST_ENDPOINT_FILE" ]]; then
-        log "pre-up: 策略为 keep 且已有 last-endpoint，保留当前 endpoint"
-        return 0
-    fi
-
     cur_ep="$(wg_peer_endpoint "$iface")"
     pub="$(wg_peer_pubkey "$iface")"
 
     [[ -n "$cur_ep" ]] && printf '%s\n' "$cur_ep" > "$OLD_ENDPOINT_FILE"
 
-    ep=""
-    if [[ "$WARP_ON_UP_POLICY" == "rotate" ]] \
-        && [[ -s "$WARP_RESULT_CSV" ]] \
-        && cache_fresh; then
-        ep="$(pick_candidate "$cur_ep")"
-        log "pre-up: 从缓存选择 $ep"
+    if ! scan_direct; then
+        log "pre-up: 扫描失败，保持当前 endpoint"
+        return 0
     fi
 
-    if [[ -z "$ep" ]]; then
-        if ! scan_direct; then
-            log "pre-up: 扫描失败，保持当前 endpoint"
-            return 0
-        fi
-        ep="$(pick_candidate "$cur_ep")"
-    fi
+    ep="$(pick_candidate "$cur_ep")"
 
     if [[ -z "$ep" ]]; then
         log "pre-up: 没有可用候选"
@@ -369,21 +413,19 @@ set_endpoint_profile() {
     nmcli connection modify "$WARP_CONN" wireguard.peers "$peer" >/dev/null 2>&1
 }
 
-activate_connection() {
-    date +%s > "$RUN_DIR/self-up" 2>/dev/null || true
-    nmcli --wait 15 connection down "$WARP_CONN" >/dev/null 2>&1 || true
-    nmcli --wait 15 connection up "$WARP_CONN" >/dev/null 2>&1
-    local rc=$?
-    rm -f "$RUN_DIR/self-up" 2>/dev/null || true
-    return "$rc"
-}
-
 try_endpoint() {
     local ep="$1"
 
     log "尝试 endpoint: $ep"
+
+    # connection modify 和 device reapply 都可能让 NetworkManager 重新激活设备，
+    # 从一开始就写标记，告诉 dispatcher 这不是用户主动断开。
+    # 全程不使用 connection down/up，因此本程序任何路径都不会主动打开隧道。
+    date +%s > "$RUN_DIR/self-up" 2>/dev/null || true
+
     if ! set_endpoint_profile "$ep"; then
         log "  profile 修改失败"
+        rm -f "$RUN_DIR/self-up" 2>/dev/null || true
         return 1
     fi
 
@@ -391,22 +433,15 @@ try_endpoint() {
         sleep 2
         if verify_warp; then
             log "  reapply 后连通正常"
+            rm -f "$RUN_DIR/self-up" 2>/dev/null || true
             return 0
         fi
-        log "  reapply 后仍不通，尝试重新激活"
+        log "  reapply 后仍不通"
+    else
+        log "  reapply 失败"
     fi
 
-    if ! activate_connection; then
-        log "  重新激活失败"
-        return 1
-    fi
-    sleep 2
-    if verify_warp; then
-        log "  重新激活后连通正常"
-        return 0
-    fi
-
-    log "  仍然不通"
+    rm -f "$RUN_DIR/self-up" 2>/dev/null || true
     return 1
 }
 
@@ -416,6 +451,11 @@ try_candidates() {
     while IFS=$'\t' read -r ep lat; do
         [[ -n "$ep" ]] || continue
         [[ -n "$exclude" && "$ep" == "$exclude" ]] && continue
+        # 用户已主动断开时立即中止，不能把隧道重新打开
+        if ! warp_is_active; then
+            log "候选尝试中止：$WARP_CONN 已不再激活"
+            return 1
+        fi
         if try_endpoint "$ep"; then
             printf '%s\n' "$ep" > "$LAST_ENDPOINT_FILE"
             return 0
@@ -475,6 +515,7 @@ verify_mode() {
             printf '%s\n' "$ok_ep" > "$LAST_ENDPOINT_FILE"
             rm -f "$PENDING_ENDPOINT_FILE" 2>/dev/null || true
             log "verify: 连通正常，当前 endpoint=$ok_ep"
+            warp_notify ok "endpoint ${ok_ep:-未知}"
             return 0
         fi
         log "verify: 首次运行且 pre-up 未产生候选，继续执行优选"
@@ -482,21 +523,12 @@ verify_mode() {
         log "verify: 当前 endpoint 不健康，开始尝试候选"
     fi
 
-    if [[ -s "$WARP_RESULT_CSV" ]] && cache_fresh; then
+    if [[ -s "$WARP_RESULT_CSV" ]]; then
         if try_candidates "$cur_ep"; then
             rm -f "$PENDING_ENDPOINT_FILE" 2>/dev/null || true
             log "verify: 候选切换成功"
+            warp_notify ok "已切换到 $(cat "$LAST_ENDPOINT_FILE" 2>/dev/null || echo 未知)"
             return 0
-        fi
-    else
-        log "verify: 缓存不存在或已过期，执行一次全量扫描"
-        nmcli --wait 15 connection down "$WARP_CONN" >/dev/null 2>&1 || true
-        if scan_direct; then
-            if try_candidates "$cur_ep"; then
-                rm -f "$PENDING_ENDPOINT_FILE" 2>/dev/null || true
-                log "verify: 扫描后切换成功"
-                return 0
-            fi
         fi
     fi
 
@@ -505,10 +537,12 @@ verify_mode() {
         printf '%s\n' "$restore_ep" > "$LAST_ENDPOINT_FILE"
         rm -f "$PENDING_ENDPOINT_FILE" 2>/dev/null || true
         log "verify: 已恢复旧 endpoint"
+        warp_notify ok "候选均不通，已回退原 endpoint"
         return 1
     fi
 
     log "verify: 旧 endpoint 也不可用，断开 $WARP_CONN 以保留物理网络"
+    warp_notify fail "所有 endpoint 都不通，已断开隧道走物理网络"
     nmcli --wait 10 connection down "$WARP_CONN" >/dev/null 2>&1 || true
     return 2
 }
@@ -579,11 +613,6 @@ status_cmd() {
     echo "endpoint   : $(nmcli_endpoint 2>/dev/null || echo 未知)"
     echo "last       : $(cat "$LAST_ENDPOINT_FILE" 2>/dev/null || echo 无)"
     echo "pending    : $(cat "$PENDING_ENDPOINT_FILE" 2>/dev/null || echo 无)"
-    if [[ -s "$SCAN_TIME_FILE" ]]; then
-        echo "scan-time  : $(date -d "@$(cat "$SCAN_TIME_FILE")" '+%F %T' 2>/dev/null || echo 无)"
-    else
-        echo "scan-time  : 无"
-    fi
     local n
     n=$(parse_candidates "$WARP_RESULT_CSV" 2>/dev/null | wc -l)
     echo "candidates : $n"

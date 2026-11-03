@@ -139,6 +139,26 @@ for c in nmcli systemctl curl awk flock install timeout; do
 done
 command -v wg >/dev/null 2>&1 || die "缺少命令: wg（wireguard-tools）"
 
+# 优选 endpoint 只通过 connection modify + device reapply 生效，
+# 不再有 connection down/up 兜底，所以显式提示这一依赖。
+if LC_ALL=C nmcli device reapply --help >/dev/null 2>&1; then
+    info "nmcli device reapply 可用"
+else
+    warn "无法确认 nmcli device reapply 可用（需要 NetworkManager >= 1.12）。"
+    warn "若后续日志出现 'reapply 失败'，说明优选 endpoint 无法生效，需升级 NetworkManager。"
+fi
+
+# 桌面通知是可选功能，不作为硬性依赖：
+# notify-send 属于 libnotify，Silverblue 上不一定有；没有它时代码退回
+# glib2 自带的 gdbus，两个都找不到时只是不提示，其他一切照常。
+if command -v notify-send >/dev/null 2>&1; then
+    info "桌面通知: notify-send"
+elif command -v gdbus >/dev/null 2>&1; then
+    info "桌面通知: 未安装 libnotify，改用 gdbus"
+else
+    warn "未找到 notify-send 和 gdbus，连通通知会被跳过"
+fi
+
 ARCH="$(arch_affix)"
 SUDO_USER_NAME="${SUDO_USER:-}"
 TARGET_HOME="$(user_home "$SUDO_USER_NAME" 2>/dev/null || true)"
@@ -364,6 +384,14 @@ fi
 info "wgcf: $WGCF_BIN"
 info "warp: $WARP_BIN"
 
+# 我们只传 -ip/-o，其余参数交给扫描器内置默认（与上游 warp-yxip.sh 一致）。
+# 这里提前确认这两个 flag 被识别：不识别的话扫描会静默产出 0 结果。
+SCAN_HELP="$("$WARP_BIN" -h 2>&1 || true)"
+if ! grep -q -- '-ip' <<<"$SCAN_HELP" || ! grep -q -- '-o' <<<"$SCAN_HELP"; then
+    warn "无法确认扫描器支持 -ip/-o 参数: $WARP_BIN"
+    warn "若日志出现 '扫描没有产生结果'，请用 '$WARP_BIN -h' 核对可用参数"
+fi
+
 # ---------- 备份 ----------
 
 STAMP="$(date +%Y%m%d-%H%M%S)"
@@ -400,7 +428,20 @@ if [[ "$WARP_BIN" != "$LIBDIR/warp" ]]; then
     run install -m 0755 "$WARP_BIN" "$LIBDIR/warp"
 fi
 run install -m 0755 "$SRC_DIR/lib/warp-optip-engine.sh" "$LIBDIR/warp-optip-engine.sh"
+# 通知模块是被 source 的库，不需要执行位；缺失时 engine 用空函数兜底
+run install -m 0644 "$SRC_DIR/lib/warp-optip-notify.sh" "$LIBDIR/warp-optip-notify.sh"
 run install -m 0755 "$SRC_DIR/bin/warp-optip" "$BINDIR/warp-optip"
+
+# 不要给通知安装同名 .desktop。
+#
+# GNOME 会按 app_name 反查 <app_name>.desktop：一旦查到，通知就会和发送者
+# （notify-send / gdbus 的连接）绑定；这两个都是一次性进程，发完就退出，
+# GNOME 的 FdoNotificationDaemonSource 随即销毁整个 source，通知连
+# “通知面板”里都留不下。
+#
+# 保持 app_name 解析不到应用，GNOME 才会走 generic source，通知会留在面板里。
+# 这里顺手清掉旧版本安装过的文件，升级后立即生效。
+run rm -f "$PREFIX/share/applications/warp-optip.desktop"
 
 if [[ "$NO_SERVICE" -eq 0 ]]; then
     sed "s#/usr/local/bin/warp-optip#$BINDIR/warp-optip#g" \
@@ -413,6 +454,59 @@ if [[ "$NO_DISPATCHER" -eq 0 ]]; then
         "$SRC_DIR/dispatcher/pre-up.d/90-warp-optip" > "$TMPDIR_INSTALL/90-warp-optip"
     run install -m 0755 -o root -g root "$TMPDIR_INSTALL/90-warp-optip" "$PREUP_SCRIPT"
     run install -m 0755 -o root -g root "$SRC_DIR/dispatcher/dispatcher.d/90-warp-optip-verify" "$VERIFY_SCRIPT"
+fi
+
+# ---------- 配置 ----------
+#
+# 必须在创建/导入连接之前写好 $CONF：
+# 两个 dispatcher 钩子的第一行都是「没有 conf 就退出」，而
+# `nmcli connection import` 生成的连接自带 autoconnect yes，
+# NM 对 WireGuard 这类虚拟设备会在连接出现后立刻自动激活。
+# 若此时 conf 还不存在，pre-up 会在写下任何日志之前静默退出，
+# 隧道带着默认 endpoint 起来 —— 用户看到的就是「没开 VPN 但上不了网」，
+# 而且日志里查不到原因。
+# 指定 --autoconnect 时这条早期自动激活同样会正常走扫描。
+
+CONF_CONTENT="$(cat <<EOF
+# 由 install.sh 生成
+WARP_CONN=$CONN
+WARP_IFACE=$CONN
+WARP_STATE_DIR=$STATE_DIR
+WARP_RESULT_CSV=$STATE_DIR/result.csv
+WARP_SCAN_BIN=$LIBDIR/warp
+
+WARP_SCAN_RANGES=162.159.192.0/24,162.159.193.0/24,162.159.195.0/24,188.114.96.0/22
+WARP_MAX_LOSS=20
+WARP_MAX_LATENCY=200
+WARP_LIMIT=20
+
+WARP_ON_UP_POLICY=keep
+
+WARP_CHECK_URL=https://1.1.1.1/cdn-cgi/trace
+
+WARP_SCAN_TIMEOUT=18
+WARP_PREUP_TIMEOUT=25
+
+# 扫描时强制探测流量走物理网络（pre-up 阶段 NM 已装好 WG 策略路由）
+# NM 的规则优先级由连接 UUID 派生，范围 30768~31766；这里必须比它小
+WARP_SCAN_FORCE_PHYSICAL=1
+WARP_SCAN_RULE_PREF=30000
+# 仅用于日志：验证扫描流量实际走物理网关
+WARP_SCAN_PROBE_IP=162.159.192.1
+
+# 连通/失败时发一条桌面通知（1 开启，0 关闭）。
+# 通知发给「当前有登录会话的用户」；多用户机器可以写死用户名。
+# 发不出时静默，不影响任何功能。
+WARP_NOTIFY=1
+WARP_NOTIFY_USER=
+EOF
+)"
+
+if [[ "$DRY_RUN" -eq 1 ]]; then
+    printf '[dry-run] 写入 %s:\n%s\n' "$CONF" "$CONF_CONTENT"
+else
+    printf '%s\n' "$CONF_CONTENT" > "$CONF"
+    chmod 0644 "$CONF"
 fi
 
 # ---------- 注册 / 生成 / 导入 ----------
@@ -486,39 +580,6 @@ if [[ "$NO_PERMISSIONS" -eq 0 ]]; then
         nmcli connection modify "$CONN" connection.permissions "user:$SUDO_USER_NAME"
         info "connection.permissions = user:$SUDO_USER_NAME"
     fi
-fi
-
-# ---------- 配置 ----------
-
-CONF_CONTENT="$(cat <<EOF
-# 由 install.sh 生成
-WARP_CONN=$CONN
-WARP_IFACE=$CONN
-WARP_STATE_DIR=$STATE_DIR
-WARP_RESULT_CSV=$STATE_DIR/result.csv
-WARP_SCAN_BIN=$LIBDIR/warp
-
-WARP_SCAN_RANGES=162.159.192.0/24,162.159.193.0/24,162.159.195.0/24,188.114.96.0/22
-WARP_MAX_LOSS=20
-WARP_MAX_LATENCY=200
-WARP_LIMIT=20
-
-WARP_ON_UP_POLICY=keep
-WARP_CACHE_MAX_AGE=21600
-
-WARP_PHYSICAL_CHECK_URL=https://www.baidu.com
-WARP_CHECK_URL=https://1.1.1.1/cdn-cgi/trace
-
-WARP_SCAN_TIMEOUT=18
-WARP_PREUP_TIMEOUT=25
-EOF
-)"
-
-if [[ "$DRY_RUN" -eq 1 ]]; then
-    printf '[dry-run] 写入 %s:\n%s\n' "$CONF" "$CONF_CONTENT"
-else
-    printf '%s\n' "$CONF_CONTENT" > "$CONF"
-    chmod 0644 "$CONF"
 fi
 
 # ---------- 重载 ----------
