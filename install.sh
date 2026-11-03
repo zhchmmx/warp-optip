@@ -129,8 +129,6 @@ done
 
 LIBDIR="$PREFIX/lib/warp-optip"
 BINDIR="$PREFIX/bin"
-APPSDIR="$PREFIX/share/applications"
-DESKTOP_FILE="$APPSDIR/warp-optip.desktop"
 
 if [[ "$DRY_RUN" -eq 0 && "$(id -u)" -ne 0 ]]; then
     die "请用 sudo 运行: sudo $0"
@@ -201,7 +199,6 @@ if [[ "$DRY_RUN" -eq 1 ]]; then
   - 安装目录: $LIBDIR
   - 状态目录: $STATE_DIR
   - 配置文件: $CONF
-  - 桌面条目: $DESKTOP_FILE
   - systemd 单元: $UNIT
   - pre-up 脚本: $PREUP_SCRIPT
   - up 校验脚本: $VERIFY_SCRIPT
@@ -435,22 +432,16 @@ run install -m 0755 "$SRC_DIR/lib/warp-optip-engine.sh" "$LIBDIR/warp-optip-engi
 run install -m 0644 "$SRC_DIR/lib/warp-optip-notify.sh" "$LIBDIR/warp-optip-notify.sh"
 run install -m 0755 "$SRC_DIR/bin/warp-optip" "$BINDIR/warp-optip"
 
-# GNOME 按 app_name 找同名 .desktop 来决定通知的显示名和图标。
-# ostree 上 /usr/share 只读，$PREFIX/share（/usr/local -> /var/usrlocal）可写。
-cat > "$TMPDIR_INSTALL/warp-optip.desktop" <<'EOF'
-[Desktop Entry]
-Type=Application
-Name=warp-optip
-GenericName=WARP endpoint optimizer
-GenericName[zh_CN]=WARP endpoint 优选
-Comment=Reports WARP connectivity from a system service
-Comment[zh_CN]=系统服务的 WARP 连通状态提示
-Icon=network-vpn
-NoDisplay=true
-X-GNOME-UsesNotifications=true
-EOF
-run install -d -m 0755 "$APPSDIR"
-run install -m 0644 "$TMPDIR_INSTALL/warp-optip.desktop" "$DESKTOP_FILE"
+# 不要给通知安装同名 .desktop。
+#
+# GNOME 会按 app_name 反查 <app_name>.desktop：一旦查到，通知就会和发送者
+# （notify-send / gdbus 的连接）绑定；这两个都是一次性进程，发完就退出，
+# GNOME 的 FdoNotificationDaemonSource 随即销毁整个 source，通知连
+# “通知面板”里都留不下。
+#
+# 保持 app_name 解析不到应用，GNOME 才会走 generic source，通知会留在面板里。
+# 这里顺手清掉旧版本安装过的文件，升级后立即生效。
+run rm -f "$PREFIX/share/applications/warp-optip.desktop"
 
 if [[ "$NO_SERVICE" -eq 0 ]]; then
     sed "s#/usr/local/bin/warp-optip#$BINDIR/warp-optip#g" \

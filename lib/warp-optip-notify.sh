@@ -17,6 +17,11 @@
 # 立刻关闭，表现为 "The connection is closed" —— root 连用户总线正是这种
 # 情况。所以发之前必须先变成那个用户本身；DISPLAY/XAUTHORITY/WAYLAND_DISPLAY
 # 在这里完全不相关，通知只走 D-Bus。
+#
+# 另一个约束：不要为通知安装 <app_name>.desktop（当前 app_name 是 warp-optip）。
+# GNOME 会按 app_name 反查 .desktop；一旦查到，通知就绑定到发送进程的 D-Bus
+# 连接上，而 notify-send/gdbus 都是一次性进程，退出后 GNOME 会销毁整个 source，
+# 通知在通知面板里也会被一起删掉。解析不到应用时走 generic source，通知才会留下。
 
 # ---------- 可配置项（在 /etc/warp-optip.conf 里覆盖） ----------
 
@@ -33,7 +38,7 @@ NOTIFY_MARK_FILE="${RUN_DIR:-/run/warp-optip}/notify-last"
 
 # 每行输出「uid user」。找不到接收者时不输出。
 warp_notify_targets() {
-    local uid user dir
+    local uid user dir found=""
 
     if [[ -n "$WARP_NOTIFY_USER" ]]; then
         uid="$(id -u "$WARP_NOTIFY_USER" 2>/dev/null)" || return 1
@@ -44,20 +49,27 @@ warp_notify_targets() {
 
     # 有会话的用户优先
     if command -v loginctl >/dev/null 2>&1; then
-        loginctl list-sessions --no-legend 2>/dev/null \
+        found="$(loginctl list-sessions --no-legend 2>/dev/null \
             | awk '$2 ~ /^[0-9]+$/ && $2 != "0" {print $2, $3}' \
-            | sort -u
+            | sort -u)"
     fi
 
-    # loginctl 不可用或没有会话时，退回扫描 /run/user
-    for dir in /run/user/*; do
-        [[ -S "$dir/bus" ]] || continue
-        uid="${dir#/run/user/}"
-        [[ "$uid" =~ ^[0-9]+$ ]] || continue
-        [[ "$uid" != "0" ]] || continue
-        user="$(id -un "$uid" 2>/dev/null)" || continue
-        printf '%s %s\n' "$uid" "$user"
-    done | sort -u -n
+    # loginctl 不可用或没有会话时，才退回扫描 /run/user
+    if [[ -z "$found" ]]; then
+        found="$(
+            for dir in /run/user/*; do
+                [[ -S "$dir/bus" ]] || continue
+                uid="${dir#/run/user/}"
+                [[ "$uid" =~ ^[0-9]+$ ]] || continue
+                [[ "$uid" != "0" ]] || continue
+                user="$(id -un "$uid" 2>/dev/null)" || continue
+                printf '%s %s\n' "$uid" "$user"
+            done | sort -u -n
+        )"
+    fi
+
+    [[ -n "$found" ]] || return 1
+    printf '%s\n' "$found"
 }
 
 # ---------- 发送 ----------
@@ -67,6 +79,7 @@ warp_notify_send() {
     local uid="$1" user="$2" title="$3" body="$4" urg="$5"
     local dir="/run/user/$uid"
     local -a base
+    local urg_byte=1
 
     [[ -S "$dir/bus" ]] || return 1
 
@@ -86,9 +99,18 @@ warp_notify_send() {
     title="${title//\"/}"
     body="${body//\"/}"
 
+    # gdbus 不会像 notify-send 那样从 -u 推导 urgency，必须显式写进 hints。
+    # GNOME 对 urgency=low 的通知只收进列表、不弹横幅。
+    case "$urg" in
+        low)      urg_byte=0 ;;
+        normal)   urg_byte=1 ;;
+        critical) urg_byte=2 ;;
+        *)        urg_byte=1 ;;
+    esac
+
     if command -v notify-send >/dev/null 2>&1; then
         timeout "${WARP_NOTIFY_TIMEOUT}s" "${base[@]}" \
-            notify-send -a warp-optip -u "$urg" "$title" "$body" >/dev/null 2>&1 && return 0
+            notify-send -a warp-optip -i network-vpn -u "$urg" "$title" "$body" >/dev/null 2>&1 && return 0
     fi
 
     # 兜底：gdbus 属于 glib2，GNOME 上一定在；Silverblue 不能随手装 libnotify
@@ -98,7 +120,8 @@ warp_notify_send() {
             --dest org.freedesktop.Notifications \
             --object-path /org/freedesktop/Notifications \
             --method org.freedesktop.Notifications.Notify \
-            "warp-optip" 0 "" "$title" "$body" "[]" "{}" 5000 >/dev/null 2>&1
+            "warp-optip" 0 "network-vpn" "$title" "$body" "[]" \
+            "{'urgency': <byte $urg_byte>}" 5000 >/dev/null 2>&1
 }
 
 # ---------- 对外接口 ----------
@@ -113,9 +136,9 @@ warp_notify() {
     [[ "$WARP_NOTIFY_DEDUPE" =~ ^[0-9]+$ ]] || WARP_NOTIFY_DEDUPE=60
 
     case "$state" in
-        ok)   title="$WARP_NOTIFY_TITLE_OK";   urg=low    ;;
+        ok)   title="$WARP_NOTIFY_TITLE_OK";   urg=normal ;;
         fail) title="$WARP_NOTIFY_TITLE_FAIL"; urg=normal ;;
-        *)    title="warp-optip";              urg=low    ;;
+        *)    title="warp-optip";              urg=normal ;;
     esac
 
     # 同状态同正文在一个短窗口内只发一次：一次连接可能连续触发多次 verify

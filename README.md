@@ -206,6 +206,11 @@ tail -f /run/warp-optip/pre-up.log
 接收者默认取「当前有登录会话的用户」（`loginctl`，取不到时扫 `/run/user/*/bus`），
 多用户或自动登录场景可以在配置里写死 `WARP_NOTIFY_USER`。
 
+安装器**不会**为通知安装同名 `.desktop`。GNOME 会按 `app_name` 反查应用；
+一旦解析成功，通知就会绑定到 `notify-send`/`gdbus` 的临时 D-Bus 连接上，
+进程退出后 GNOME 会销毁整个通知源，连通知面板里的记录都会消失。保持解析
+不到应用（generic source）才能让通知留在面板里。
+
 这是纯附加功能：没人登录、没装通知工具、GNOME 开了免打扰，都只会静默跳过，
 每条外部命令都带超时，不会拖慢 `verify`。日志里出现 `通知未送达` 说明当时没发出去。
 
