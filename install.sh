@@ -139,6 +139,15 @@ for c in nmcli systemctl curl awk flock install timeout; do
 done
 command -v wg >/dev/null 2>&1 || die "缺少命令: wg（wireguard-tools）"
 
+# 优选 endpoint 只通过 connection modify + device reapply 生效，
+# 不再有 connection down/up 兜底，所以显式提示这一依赖。
+if LC_ALL=C nmcli device reapply --help >/dev/null 2>&1; then
+    info "nmcli device reapply 可用"
+else
+    warn "无法确认 nmcli device reapply 可用（需要 NetworkManager >= 1.12）。"
+    warn "若后续日志出现 'reapply 失败'，说明优选 endpoint 无法生效，需升级 NetworkManager。"
+fi
+
 ARCH="$(arch_affix)"
 SUDO_USER_NAME="${SUDO_USER:-}"
 TARGET_HOME="$(user_home "$SUDO_USER_NAME" 2>/dev/null || true)"

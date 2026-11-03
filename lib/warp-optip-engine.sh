@@ -180,6 +180,7 @@ pick_candidate() {
 # ---------- 直连扫描 ----------
 
 cleanup_all() {
+    rm -f "$RUN_DIR/self-up" 2>/dev/null || true
     if [[ -n "$SCAN_CHILD" ]] && kill -0 "$SCAN_CHILD" 2>/dev/null; then
         kill "$SCAN_CHILD" 2>/dev/null || true
     fi
@@ -310,21 +311,19 @@ set_endpoint_profile() {
     nmcli connection modify "$WARP_CONN" wireguard.peers "$peer" >/dev/null 2>&1
 }
 
-activate_connection() {
-    date +%s > "$RUN_DIR/self-up" 2>/dev/null || true
-    nmcli --wait 15 connection down "$WARP_CONN" >/dev/null 2>&1 || true
-    nmcli --wait 15 connection up "$WARP_CONN" >/dev/null 2>&1
-    local rc=$?
-    rm -f "$RUN_DIR/self-up" 2>/dev/null || true
-    return "$rc"
-}
-
 try_endpoint() {
     local ep="$1"
 
     log "尝试 endpoint: $ep"
+
+    # connection modify 和 device reapply 都可能让 NetworkManager 重新激活设备，
+    # 从一开始就写标记，告诉 dispatcher 这不是用户主动断开。
+    # 全程不使用 connection down/up，因此本程序任何路径都不会主动打开隧道。
+    date +%s > "$RUN_DIR/self-up" 2>/dev/null || true
+
     if ! set_endpoint_profile "$ep"; then
         log "  profile 修改失败"
+        rm -f "$RUN_DIR/self-up" 2>/dev/null || true
         return 1
     fi
 
@@ -332,22 +331,15 @@ try_endpoint() {
         sleep 2
         if verify_warp; then
             log "  reapply 后连通正常"
+            rm -f "$RUN_DIR/self-up" 2>/dev/null || true
             return 0
         fi
-        log "  reapply 后仍不通，尝试重新激活"
+        log "  reapply 后仍不通"
+    else
+        log "  reapply 失败"
     fi
 
-    if ! activate_connection; then
-        log "  重新激活失败"
-        return 1
-    fi
-    sleep 2
-    if verify_warp; then
-        log "  重新激活后连通正常"
-        return 0
-    fi
-
-    log "  仍然不通"
+    rm -f "$RUN_DIR/self-up" 2>/dev/null || true
     return 1
 }
 

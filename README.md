@@ -5,6 +5,7 @@ WARP Endpoint 自动优选工具。
 - 在 NetworkManager **pre-up** 阶段（正在连接时）同步扫描生成候选列表并设置优选 endpoint。
 - up 之后异步校验 `warp=on`，失败则用候选逐个实测换下一个。
 - 扫描只发生在 pre-up；verify 不会为了扫描断开已有连接，用户主动断开时 verify 立即中止。
+- 程序全程不执行 `nmcli connection up`：隧道只可能由用户打开，因此一定关得掉。
 - 首次安装会新建独立连接（默认 `warp-optip`），**不修改现有 `wgcf-profile`**。
 
 ## 原理
@@ -41,7 +42,7 @@ verify 阶段。
 
 ## 依赖
 
-- Linux + NetworkManager（支持原生 WireGuard）
+- Linux + NetworkManager >= 1.12（支持原生 WireGuard 和 `nmcli device reapply`）
 - `nmcli`、`systemctl`、`curl`、`awk`、`flock`、`timeout`、`wg`
 - root/sudo
 - 首次注册需要访问 Cloudflare API；下载二进制需要网络（或本地提供）
@@ -279,8 +280,9 @@ tail -n 100 /run/warp-optip/pre-up.log
 sudo journalctl -u NetworkManager -n 100 --no-pager
 ```
 
-若 NetworkManager 在 pre-up 后覆盖了运行时 endpoint，verify 阶段会再 `reapply` 一次；
-仍然不行则回退到 `nmcli connection up`。
+若 NetworkManager 在 pre-up 后覆盖了运行时 endpoint，verify 阶段会用
+`nmcli connection modify` + `nmcli device reapply` 重新应用配置。程序本身不执行
+`nmcli connection up`，所以隧道只可能由用户打开。
 
 ### 当前 IP 不健康但不换
 
