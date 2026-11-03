@@ -373,6 +373,14 @@ fi
 info "wgcf: $WGCF_BIN"
 info "warp: $WARP_BIN"
 
+# 我们只传 -ip/-o，其余参数交给扫描器内置默认（与上游 warp-yxip.sh 一致）。
+# 这里提前确认这两个 flag 被识别：不识别的话扫描会静默产出 0 结果。
+SCAN_HELP="$("$WARP_BIN" -h 2>&1 || true)"
+if ! grep -q -- '-ip' <<<"$SCAN_HELP" || ! grep -q -- '-o' <<<"$SCAN_HELP"; then
+    warn "无法确认扫描器支持 -ip/-o 参数: $WARP_BIN"
+    warn "若日志出现 '扫描没有产生结果'，请用 '$WARP_BIN -h' 核对可用参数"
+fi
+
 # ---------- 备份 ----------
 
 STAMP="$(date +%Y%m%d-%H%M%S)"

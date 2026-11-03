@@ -18,7 +18,7 @@ NetworkManager: 正在连接（pending）
         │
         ▼
 pre-up.d/90-warp-optip   （同步，最多 25 秒）
-        ├─ 每次 up 都直连扫描，生成候选列表
+        ├─ 每次 up 都直连扫描，生成候选列表（只传 -ip/-o，并发用扫描器内置默认）
         ├─ 选候选
         ├─ wg set <iface> peer <pub> endpoint IP:PORT
         └─ 返回
