@@ -32,6 +32,23 @@ WARP_CHECK_URL="${WARP_CHECK_URL:-https://1.1.1.1/cdn-cgi/trace}"
 WARP_SCAN_TIMEOUT="${WARP_SCAN_TIMEOUT:-18}"
 WARP_PREUP_TIMEOUT="${WARP_PREUP_TIMEOUT:-25}"
 
+# 扫描时强制走物理网络：pre-up 阶段 NM 会很快装好 WireGuard 的策略路由，
+# 不强制的话探测会进隧道。规则只匹配扫描网段，扫完即删。
+WARP_SCAN_FORCE_PHYSICAL="${WARP_SCAN_FORCE_PHYSICAL:-1}"
+WARP_SCAN_RULE_PREF="${WARP_SCAN_RULE_PREF:-30000}"
+WARP_SCAN_PROBE_IP="${WARP_SCAN_PROBE_IP:-162.159.192.1}"
+
+# NetworkManager 给 WireGuard 自动默认路由选的规则优先级由连接 UUID 派生，
+# 范围是 30768~31766 的偶数。扫描规则必须比它更小才能先命中；
+# 旧配置里的 31000 会随机失效，这里统一钳制到安全值。
+SCAN_RULE_PREF_CLAMPED=""
+if [[ ! "$WARP_SCAN_RULE_PREF" =~ ^[0-9]+$ ]] \
+    || (( 10#$WARP_SCAN_RULE_PREF < 1 )) \
+    || (( 10#$WARP_SCAN_RULE_PREF >= 30768 )); then
+    SCAN_RULE_PREF_CLAMPED="$WARP_SCAN_RULE_PREF"
+    WARP_SCAN_RULE_PREF=30000
+fi
+
 LOG_FILE="$WARP_STATE_DIR/warp-optip.log"
 RUN_DIR="/run/warp-optip"
 LAST_ENDPOINT_FILE="$WARP_STATE_DIR/last-endpoint"
@@ -42,6 +59,7 @@ DISABLED_FILE="$WARP_STATE_DIR/disabled"
 IFACE="${DEVICE_IFACE:-$WARP_IFACE}"
 
 SCAN_CHILD=""
+SCAN_RULES_ACTIVE=0
 
 # ---------- 基础工具 ----------
 
@@ -178,7 +196,85 @@ pick_candidate() {
 
 # ---------- 直连扫描 ----------
 
+# 扫描期间把目标为扫描网段的流量压回 main 表（物理默认路由）。
+#
+# NetworkManager 给 WireGuard 自动装好的规则大致是：
+#   31444: from all lookup main suppress_prefixlength 0
+#   31445: not from all fwmark 0xcc41 lookup 52289
+# 31444 对所有流量生效，所以只给探测包打 fwmark 不够；必须在它之前
+# （更小的 pref）插一条只匹配扫描网段的规则，让探测查 main 表。
+# 规则扫完即删，不影响宿主其它流量，也不影响 wg 自己的握手包。
+scan_rules_flush() {
+    command -v ip >/dev/null 2>&1 || return 0
+    local -a ranges
+    IFS=, read -r -a ranges <<< "$WARP_SCAN_RANGES"
+    local r
+    for r in "${ranges[@]}"; do
+        r="${r//[[:space:]]/}"
+        [[ -n "$r" ]] || continue
+        while ip -4 rule del pref "$WARP_SCAN_RULE_PREF" to "$r" lookup main 2>/dev/null; do
+            :
+        done
+    done
+}
+
+scan_rules_remove() {
+    [[ "$SCAN_RULES_ACTIVE" -eq 1 ]] || return 0
+    scan_rules_flush
+    SCAN_RULES_ACTIVE=0
+}
+
+scan_rules_add() {
+    [[ "$WARP_SCAN_FORCE_PHYSICAL" == "1" ]] || return 0
+
+    if [[ "$(id -u)" -ne 0 ]]; then
+        log "扫描出口: 非 root，无法强制物理网络（扫描继续）"
+        return 1
+    fi
+    command -v ip >/dev/null 2>&1 || { log "扫描出口: 缺少 ip 命令"; return 1; }
+
+    # 清掉上次异常退出可能残留的规则
+    scan_rules_flush
+
+    local -a ranges
+    IFS=, read -r -a ranges <<< "$WARP_SCAN_RANGES"
+    local r n=0
+    for r in "${ranges[@]}"; do
+        r="${r//[[:space:]]/}"
+        [[ -n "$r" ]] || continue
+        if ip -4 rule add pref "$WARP_SCAN_RULE_PREF" to "$r" lookup main 2>/dev/null; then
+            n=$((n + 1))
+        else
+            log "扫描出口: 添加规则失败 to $r"
+        fi
+    done
+
+    if [[ "$n" -gt 0 ]]; then
+        SCAN_RULES_ACTIVE=1
+        if [[ -n "$SCAN_RULE_PREF_CLAMPED" ]]; then
+            log "扫描出口: 配置的 pref $SCAN_RULE_PREF_CLAMPED 不安全，改用 $WARP_SCAN_RULE_PREF（NM 的规则可能低到 30768）"
+        fi
+        log "扫描出口: 已强制 $n 个网段走物理网络 (pref $WARP_SCAN_RULE_PREF)"
+        if [[ -n "$WARP_SCAN_PROBE_IP" ]]; then
+            local route
+            route="$(ip route get "$WARP_SCAN_PROBE_IP" 2>&1 | head -n1)"
+            log "扫描出口: $route"
+            if [[ "$route" == *" dev ${WARP_IFACE} "* || "$route" == *" table "* ]]; then
+                log "扫描出口: 警告，探测仍可能走隧道；当前规则:"
+                ip -4 rule show 2>/dev/null | while IFS= read -r line; do
+                    log "  $line"
+                done
+            fi
+        fi
+        return 0
+    fi
+
+    log "扫描出口: 没有添加任何规则，探测可能仍走隧道"
+    return 1
+}
+
 cleanup_all() {
+    scan_rules_remove
     rm -f "$RUN_DIR/self-up" 2>/dev/null || true
     if [[ -n "$SCAN_CHILD" ]] && kill -0 "$SCAN_CHILD" 2>/dev/null; then
         kill "$SCAN_CHILD" 2>/dev/null || true
@@ -197,6 +293,9 @@ scan_direct() {
 
     log "开始扫描: $WARP_SCAN_RANGES"
 
+    # 让探测流量绕过可能已经生效的 WireGuard 策略路由
+    scan_rules_add || true
+
     # 与上游 warp-yxip.sh 保持一致：它除了 -ip/-o 之外不传任何参数，
     # 并发和筛选全用内置默认；并且先把 fd 上限抬到 102400。
     # 之前我们传的 -t 2 把并发压成 2，1792 个地址在 18 秒内根本测不完，
@@ -211,6 +310,9 @@ scan_direct() {
     wait "$SCAN_CHILD"
     rc=$?
     SCAN_CHILD=""
+
+    # 探测结束立刻恢复系统路由，不等脚本退出
+    scan_rules_remove
 
     if [[ "$rc" -ne 0 ]]; then
         log "扫描器退出码: $rc"

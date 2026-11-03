@@ -3,6 +3,7 @@
 WARP Endpoint 自动优选工具。
 
 - 在 NetworkManager **pre-up** 阶段（正在连接时）同步扫描生成候选列表并设置优选 endpoint。
+- 扫描期间用临时 `ip rule` 把探测流量压回物理网络，避免被 WireGuard 策略路由带进隧道。
 - up 之后异步校验 `warp=on`，失败则用候选逐个实测换下一个。
 - 扫描只发生在 pre-up；verify 不会为了扫描断开已有连接，用户主动断开时 verify 立即中止。
 - 程序全程不执行 `nmcli connection up`：隧道只可能由用户打开，因此一定关得掉。
@@ -18,7 +19,9 @@ NetworkManager: 正在连接（pending）
         │
         ▼
 pre-up.d/90-warp-optip   （同步，最多 25 秒）
+        ├─ 临时 ip rule：扫描网段强制走物理表（main）
         ├─ 每次 up 都直连扫描，生成候选列表（只传 -ip/-o，并发用扫描器内置默认）
+        ├─ 删除临时 ip rule
         ├─ 选候选
         ├─ wg set <iface> peer <pub> endpoint IP:PORT
         └─ 返回
@@ -40,10 +43,16 @@ pre-up 阶段**不能**调用 `nmcli connection up/down/modify`，否则可能�
 死锁。因此 pre-up 只用 `wg set` 改运行时 endpoint；`nmcli` 操作全部放在 up 后的
 verify 阶段。
 
+另外，NetworkManager 会在激活开始后几百毫秒内装好 WireGuard 的自动默认路由
+（`ip rule ... lookup 52289` + fwmark），此时扫描流量会被带进隧道，测到的就不是
+物理网络的可达性。所以扫描前会临时插入一条优先级更高的 `ip rule`，把目标为
+`WARP_SCAN_RANGES` 的流量压回 `main` 表（物理默认路由），扫描结束后立即删除。
+这只会影响扫描网段，宿主其它流量仍走隧道。
+
 ## 依赖
 
 - Linux + NetworkManager >= 1.12（支持原生 WireGuard 和 `nmcli device reapply`）
-- `nmcli`、`systemctl`、`curl`、`awk`、`flock`、`timeout`、`wg`
+- `nmcli`、`ip`、`systemctl`、`curl`、`awk`、`flock`、`timeout`、`wg`
 - root/sudo
 - 首次注册需要访问 Cloudflare API；下载二进制需要网络（或本地提供）
 
@@ -144,6 +153,7 @@ nmcli connection down warp-optip
 每次 up：
 
 - pre-up 阶段无条件直连扫描，生成新的候选列表（最多 25 秒，图标显示“正在连接”）。
+  扫描期间探测流量被临时规则压回物理网络，不会走当前隧道。
 - 当前 endpoint 健康：verify 只确认 `warp=on`，不换 IP、不断网。
 - 当前 endpoint 不健康：用本次扫描出的候选逐个实测，直到连通；verify 不会重新扫描。
 - 全部失败：恢复旧 endpoint；旧 endpoint 也不行则断开 WARP，保证物理网络可用。
@@ -201,6 +211,13 @@ WARP_CHECK_URL=https://1.1.1.1/cdn-cgi/trace
 
 WARP_SCAN_TIMEOUT=18
 WARP_PREUP_TIMEOUT=25
+
+# 扫描时强制走物理网络（pre-up 阶段 NM 已装好 WG 策略路由）
+# NM 的规则优先级由连接 UUID 派生，范围 30768~31766，这里必须更小
+WARP_SCAN_FORCE_PHYSICAL=1
+WARP_SCAN_RULE_PREF=30000
+# 只用于日志：验证扫描流量实际走物理网关
+WARP_SCAN_PROBE_IP=162.159.192.1
 ```
 
 ## 卸载

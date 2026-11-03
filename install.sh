@@ -526,6 +526,13 @@ WARP_CHECK_URL=https://1.1.1.1/cdn-cgi/trace
 
 WARP_SCAN_TIMEOUT=18
 WARP_PREUP_TIMEOUT=25
+
+# 扫描时强制探测流量走物理网络（pre-up 阶段 NM 已装好 WG 策略路由）
+# NM 的规则优先级由连接 UUID 派生，范围 30768~31766；这里必须比它小
+WARP_SCAN_FORCE_PHYSICAL=1
+WARP_SCAN_RULE_PREF=30000
+# 仅用于日志：验证扫描流量实际走物理网关
+WARP_SCAN_PROBE_IP=162.159.192.1
 EOF
 )"
 
