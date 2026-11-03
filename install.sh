@@ -432,6 +432,53 @@ if [[ "$NO_DISPATCHER" -eq 0 ]]; then
     run install -m 0755 -o root -g root "$SRC_DIR/dispatcher/dispatcher.d/90-warp-optip-verify" "$VERIFY_SCRIPT"
 fi
 
+# ---------- 配置 ----------
+#
+# 必须在创建/导入连接之前写好 $CONF：
+# 两个 dispatcher 钩子的第一行都是「没有 conf 就退出」，而
+# `nmcli connection import` 生成的连接自带 autoconnect yes，
+# NM 对 WireGuard 这类虚拟设备会在连接出现后立刻自动激活。
+# 若此时 conf 还不存在，pre-up 会在写下任何日志之前静默退出，
+# 隧道带着默认 endpoint 起来 —— 用户看到的就是「没开 VPN 但上不了网」，
+# 而且日志里查不到原因。
+# 指定 --autoconnect 时这条早期自动激活同样会正常走扫描。
+
+CONF_CONTENT="$(cat <<EOF
+# 由 install.sh 生成
+WARP_CONN=$CONN
+WARP_IFACE=$CONN
+WARP_STATE_DIR=$STATE_DIR
+WARP_RESULT_CSV=$STATE_DIR/result.csv
+WARP_SCAN_BIN=$LIBDIR/warp
+
+WARP_SCAN_RANGES=162.159.192.0/24,162.159.193.0/24,162.159.195.0/24,188.114.96.0/22
+WARP_MAX_LOSS=20
+WARP_MAX_LATENCY=200
+WARP_LIMIT=20
+
+WARP_ON_UP_POLICY=keep
+
+WARP_CHECK_URL=https://1.1.1.1/cdn-cgi/trace
+
+WARP_SCAN_TIMEOUT=18
+WARP_PREUP_TIMEOUT=25
+
+# 扫描时强制探测流量走物理网络（pre-up 阶段 NM 已装好 WG 策略路由）
+# NM 的规则优先级由连接 UUID 派生，范围 30768~31766；这里必须比它小
+WARP_SCAN_FORCE_PHYSICAL=1
+WARP_SCAN_RULE_PREF=30000
+# 仅用于日志：验证扫描流量实际走物理网关
+WARP_SCAN_PROBE_IP=162.159.192.1
+EOF
+)"
+
+if [[ "$DRY_RUN" -eq 1 ]]; then
+    printf '[dry-run] 写入 %s:\n%s\n' "$CONF" "$CONF_CONTENT"
+else
+    printf '%s\n' "$CONF_CONTENT" > "$CONF"
+    chmod 0644 "$CONF"
+fi
+
 # ---------- 注册 / 生成 / 导入 ----------
 
 import_connection() {
@@ -503,44 +550,6 @@ if [[ "$NO_PERMISSIONS" -eq 0 ]]; then
         nmcli connection modify "$CONN" connection.permissions "user:$SUDO_USER_NAME"
         info "connection.permissions = user:$SUDO_USER_NAME"
     fi
-fi
-
-# ---------- 配置 ----------
-
-CONF_CONTENT="$(cat <<EOF
-# 由 install.sh 生成
-WARP_CONN=$CONN
-WARP_IFACE=$CONN
-WARP_STATE_DIR=$STATE_DIR
-WARP_RESULT_CSV=$STATE_DIR/result.csv
-WARP_SCAN_BIN=$LIBDIR/warp
-
-WARP_SCAN_RANGES=162.159.192.0/24,162.159.193.0/24,162.159.195.0/24,188.114.96.0/22
-WARP_MAX_LOSS=20
-WARP_MAX_LATENCY=200
-WARP_LIMIT=20
-
-WARP_ON_UP_POLICY=keep
-
-WARP_CHECK_URL=https://1.1.1.1/cdn-cgi/trace
-
-WARP_SCAN_TIMEOUT=18
-WARP_PREUP_TIMEOUT=25
-
-# 扫描时强制探测流量走物理网络（pre-up 阶段 NM 已装好 WG 策略路由）
-# NM 的规则优先级由连接 UUID 派生，范围 30768~31766；这里必须比它小
-WARP_SCAN_FORCE_PHYSICAL=1
-WARP_SCAN_RULE_PREF=30000
-# 仅用于日志：验证扫描流量实际走物理网关
-WARP_SCAN_PROBE_IP=162.159.192.1
-EOF
-)"
-
-if [[ "$DRY_RUN" -eq 1 ]]; then
-    printf '[dry-run] 写入 %s:\n%s\n' "$CONF" "$CONF_CONTENT"
-else
-    printf '%s\n' "$CONF_CONTENT" > "$CONF"
-    chmod 0644 "$CONF"
 fi
 
 # ---------- 重载 ----------
