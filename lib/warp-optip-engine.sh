@@ -28,7 +28,6 @@ WARP_MAX_LOSS="${WARP_MAX_LOSS:-20}"
 WARP_MAX_LATENCY="${WARP_MAX_LATENCY:-200}"
 WARP_LIMIT="${WARP_LIMIT:-20}"
 WARP_ON_UP_POLICY="${WARP_ON_UP_POLICY:-keep}"
-WARP_PHYSICAL_CHECK_URL="${WARP_PHYSICAL_CHECK_URL:-https://www.baidu.com}"
 WARP_CHECK_URL="${WARP_CHECK_URL:-https://1.1.1.1/cdn-cgi/trace}"
 WARP_SCAN_TIMEOUT="${WARP_SCAN_TIMEOUT:-18}"
 WARP_PREUP_TIMEOUT="${WARP_PREUP_TIMEOUT:-25}"
@@ -188,23 +187,10 @@ cleanup_all() {
 
 trap cleanup_all EXIT INT TERM
 
-ensure_physical_network() {
-    log "检查物理网络: $WARP_PHYSICAL_CHECK_URL"
-    if ! curl -sS --max-time 8 -o /dev/null "$WARP_PHYSICAL_CHECK_URL" 2>/dev/null; then
-        log "物理网络检查失败"
-        return 1
-    fi
-    return 0
-}
-
 scan_direct() {
     local tmp rc
 
     [[ -x "$WARP_SCAN_BIN" ]] || { log "扫描器不存在: $WARP_SCAN_BIN"; return 1; }
-
-    if ! ensure_physical_network; then
-        log "物理网络检查失败，仍尝试扫描（可能是 pre-up 阶段路由尚未切换）"
-    fi
 
     tmp="$WARP_RESULT_CSV.new.$$"
     rm -f "$tmp"

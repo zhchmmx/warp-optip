@@ -514,7 +514,6 @@ WARP_LIMIT=20
 
 WARP_ON_UP_POLICY=keep
 
-WARP_PHYSICAL_CHECK_URL=https://www.baidu.com
 WARP_CHECK_URL=https://1.1.1.1/cdn-cgi/trace
 
 WARP_SCAN_TIMEOUT=18
