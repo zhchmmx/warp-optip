@@ -148,17 +148,6 @@ else
     warn "若后续日志出现 'reapply 失败'，说明优选 endpoint 无法生效，需升级 NetworkManager。"
 fi
 
-# 桌面通知是可选功能，不作为硬性依赖：
-# notify-send 属于 libnotify，Silverblue 上不一定有；没有它时代码退回
-# glib2 自带的 gdbus，两个都找不到时只是不提示，其他一切照常。
-if command -v notify-send >/dev/null 2>&1; then
-    info "桌面通知: notify-send"
-elif command -v gdbus >/dev/null 2>&1; then
-    info "桌面通知: 未安装 libnotify，改用 gdbus"
-else
-    warn "未找到 notify-send 和 gdbus，连通通知会被跳过"
-fi
-
 ARCH="$(arch_affix)"
 SUDO_USER_NAME="${SUDO_USER:-}"
 TARGET_HOME="$(user_home "$SUDO_USER_NAME" 2>/dev/null || true)"
@@ -428,20 +417,7 @@ if [[ "$WARP_BIN" != "$LIBDIR/warp" ]]; then
     run install -m 0755 "$WARP_BIN" "$LIBDIR/warp"
 fi
 run install -m 0755 "$SRC_DIR/lib/warp-optip-engine.sh" "$LIBDIR/warp-optip-engine.sh"
-# 通知模块是被 source 的库，不需要执行位；缺失时 engine 用空函数兜底
-run install -m 0644 "$SRC_DIR/lib/warp-optip-notify.sh" "$LIBDIR/warp-optip-notify.sh"
 run install -m 0755 "$SRC_DIR/bin/warp-optip" "$BINDIR/warp-optip"
-
-# 不要给通知安装同名 .desktop。
-#
-# GNOME 会按 app_name 反查 <app_name>.desktop：一旦查到，通知就会和发送者
-# （notify-send / gdbus 的连接）绑定；这两个都是一次性进程，发完就退出，
-# GNOME 的 FdoNotificationDaemonSource 随即销毁整个 source，通知连
-# “通知面板”里都留不下。
-#
-# 保持 app_name 解析不到应用，GNOME 才会走 generic source，通知会留在面板里。
-# 这里顺手清掉旧版本安装过的文件，升级后立即生效。
-run rm -f "$PREFIX/share/applications/warp-optip.desktop"
 
 if [[ "$NO_SERVICE" -eq 0 ]]; then
     sed "s#/usr/local/bin/warp-optip#$BINDIR/warp-optip#g" \
@@ -502,11 +478,6 @@ WARP_SCAN_RULE_PREF=30000
 # 仅用于日志：验证扫描流量实际走物理网关
 WARP_SCAN_PROBE_IP=162.159.192.1
 
-# 连通/失败时发一条桌面通知（1 开启，0 关闭）。
-# 通知发给「当前有登录会话的用户」；多用户机器可以写死用户名。
-# 发不出时静默，不影响任何功能。
-WARP_NOTIFY=1
-WARP_NOTIFY_USER=
 EOF
 )"
 
