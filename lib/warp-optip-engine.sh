@@ -30,8 +30,8 @@ WARP_STATE_DIR="${WARP_STATE_DIR:-/var/lib/warp-optip}"
 WARP_RESULT_CSV="${WARP_RESULT_CSV:-$WARP_STATE_DIR/result.csv}"
 WARP_SCAN_BIN="${WARP_SCAN_BIN:-/usr/local/lib/warp-optip/warp}"
 WARP_SCAN_RANGES="${WARP_SCAN_RANGES:-162.159.192.0/24,162.159.193.0/24,162.159.195.0/24,188.114.96.0/22}"
-WARP_MAX_LOSS="${WARP_MAX_LOSS:-20}"
-WARP_MAX_LATENCY="${WARP_MAX_LATENCY:-200}"
+WARP_MAX_LOSS="${WARP_MAX_LOSS:-100}"
+WARP_MAX_LATENCY="${WARP_MAX_LATENCY:-99999}"
 WARP_LIMIT="${WARP_LIMIT:-20}"
 WARP_ON_UP_POLICY="${WARP_ON_UP_POLICY:-keep}"
 WARP_CHECK_URL="${WARP_CHECK_URL:-https://1.1.1.1/cdn-cgi/trace}"
@@ -142,6 +142,18 @@ for _var in WARP_SCAN_TIMEOUT WARP_PREUP_TIMEOUT WARP_PREUP_ROUND_BUDGET; do
 done
 unset _var _val _default
 
+# 内核 WireGuard 默认不发保活包。NAT（校园网这类运营商级地址转换）的 UDP 映射
+# 一超时，冷握手的首包就被 NAT 吞掉——扫描延迟再好看，实测也不通。
+# pre-up 重建 peer 时带上这个值让映射持续温热；0 = 重建时不带、维持原状。
+WARP_PERSISTENT_KEEPALIVE="${WARP_PERSISTENT_KEEPALIVE:-25}"
+if [[ ! "$WARP_PERSISTENT_KEEPALIVE" =~ ^[0-9]+$ ]] \
+    || (( 10#$WARP_PERSISTENT_KEEPALIVE > 65535 )); then
+    log "配置 WARP_PERSISTENT_KEEPALIVE=\"$WARP_PERSISTENT_KEEPALIVE\" 无效，改用 25"
+    WARP_PERSISTENT_KEEPALIVE=25
+else
+    WARP_PERSISTENT_KEEPALIVE=$(( 10#$WARP_PERSISTENT_KEEPALIVE ))
+fi
+
 warp_is_active() {
     nmcli -t -f NAME connection show --active 2>/dev/null | grep -qx "$WARP_CONN"
 }
@@ -177,6 +189,16 @@ build_peer() {
     [[ -n "$base" ]] || return 1
     new="$(printf '%s\n' "$base" | sed -E "s#endpoint=[^ ]+#endpoint=${ep}#")"
     [[ "$new" == *"endpoint=${ep}"* ]] || return 1
+    # profile 里也要带上保活：运行时 wg set 的值撑不过下一次激活，
+    # 而 NM 重新激活时只认 profile。格式真实验证过：裸公钥开头、
+    # 连字符 key、空格分隔，persistent-keepalive 是 NM 接受的键。
+    if (( WARP_PERSISTENT_KEEPALIVE > 0 )); then
+        if [[ "$new" == *"persistent-keepalive="* ]]; then
+            new="$(printf '%s\n' "$new" | sed -E "s/persistent-keepalive=[^ ]+/persistent-keepalive=${WARP_PERSISTENT_KEEPALIVE}/")"
+        else
+            new="$new persistent-keepalive=${WARP_PERSISTENT_KEEPALIVE}"
+        fi
+    fi
     printf '%s\n' "$new"
 }
 
@@ -217,6 +239,12 @@ wg_allowed_ips_valid() {
 # 实测通过时它必须变成非 0，这一轮握手才归功于刚设上去的 endpoint。
 wg_latest_handshake() {
     wg show "$1" latest-handshakes 2>/dev/null | awk -v p="$2" -F'\t' '$1 == p {print $2}'
+}
+
+# peer 上现有的保活间隔（没设过则为空/0）。WARP_PERSISTENT_KEEPALIVE=0 时
+# 重建要以它为准，不能把 NM 配置里的值弄丢。
+wg_persistent_keepalive() {
+    wg show "$1" persistent-keepalive 2>/dev/null | awk -v p="$2" -F'\t' '$1 == p {print $2}'
 }
 
 # 每次 wg set 都带上它自己的报错。真实日志里出现过 20 个候选全部
@@ -478,7 +506,7 @@ pre_up() {
     rm -f "$PENDING_ENDPOINT_FILE" 2>/dev/null || true
 
     local iface="${DEVICE_IFACE:-$IFACE}"
-    local idx pub aips cur_ep ep lat hs0 hs1
+    local idx pub aips cur_ep ep lat hs0 hs1 ka
     local tested=0 attempts=0 reset_ok=0 peer_touched=0
     local deadline=$(( $(date +%s) + 10#$WARP_PREUP_TIMEOUT ))
     local remain
@@ -505,6 +533,15 @@ pre_up() {
         log "pre-up: 读不到 peer $pub 的 allowed-ips，无法重建 peer 逼出冷握手，实测会漏掉假阳性"
     fi
 
+    # 重建 peer 时用的保活间隔：配置值优先；配置为 0 就沿用 peer 上现有的，
+    # 免得把 NM profile 里可能设过的值弄丢。
+    if (( WARP_PERSISTENT_KEEPALIVE > 0 )); then
+        ka="$WARP_PERSISTENT_KEEPALIVE"
+    else
+        ka="$(wg_persistent_keepalive "$iface" "$pub")"
+        [[ -n "$ka" ]] || ka=0
+    fi
+
     if ! scan_direct; then
         log "pre-up: 扫描失败，保持当前 endpoint ${cur_ep:-未知}"
         return 0
@@ -519,9 +556,10 @@ pre_up() {
        (( deadline - $(date +%s) > WARP_PREUP_ROUND_BUDGET )); then
         if wg_try "$iface" peer "$pub" remove; then
             peer_touched=1
-            if wg_try_add "$iface" peer "$pub" allowed-ips "$aips" endpoint "$cur_ep"; then
+            if wg_try_add "$iface" peer "$pub" allowed-ips "$aips" endpoint "$cur_ep" \
+               persistent-keepalive "$ka"; then
                 reset_ok=1
-                log "pre-up: peer 重建可用（allowed-ips $aips，演练 endpoint $cur_ep）"
+                log "pre-up: peer 重建可用（allowed-ips $aips，keepalive ${ka}s，演练 endpoint $cur_ep）"
             else
                 # peer 已经删掉了却装不回去，此时再怎么 wg set 都只是在残骸上操作，
                 # 收手，让 verify 用 connection modify + reapply 把 peer 装回来。
@@ -559,11 +597,13 @@ pre_up() {
         # 每个候选前先删掉 peer 再原样重建，逼出一次真正的冷握手。
         if [[ "$reset_ok" -eq 1 ]]; then
             wg_try "$iface" peer "$pub" remove
-            if ! wg_try_add "$iface" peer "$pub" allowed-ips "$aips" endpoint "$ep"; then
+            if ! wg_try_add "$iface" peer "$pub" allowed-ips "$aips" endpoint "$ep" \
+               persistent-keepalive "$ka"; then
                 # 装不回去就不要再试下一个候选：接口现在没有 peer，
                 # 继续循环只会把它删得更干净。
                 log "pre-up: 重建 peer 失败，停止实测"
-                if ! wg_try_add "$iface" peer "$pub" allowed-ips "$aips" endpoint "$cur_ep"; then
+                if ! wg_try_add "$iface" peer "$pub" allowed-ips "$aips" endpoint "$cur_ep" \
+                   persistent-keepalive "$ka"; then
                     log "pre-up: 还原 peer 也失败，交给 verify 用 reapply 修复"
                 fi
                 break
@@ -616,7 +656,8 @@ pre_up() {
     if [[ -n "$cur_ep" ]]; then
         if [[ "$reset_ok" -eq 1 ]]; then
             wg_try "$iface" peer "$pub" remove || true
-            wg_try_add "$iface" peer "$pub" allowed-ips "$aips" endpoint "$cur_ep" || true
+            wg_try_add "$iface" peer "$pub" allowed-ips "$aips" endpoint "$cur_ep" \
+               persistent-keepalive "$ka" || true
         else
             wg_try "$iface" peer "$pub" endpoint "$cur_ep" || true
         fi

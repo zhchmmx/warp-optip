@@ -267,8 +267,8 @@ WARP_RESULT_CSV=/var/lib/warp-optip/result.csv
 WARP_SCAN_BIN=/usr/local/lib/warp-optip/warp
 
 WARP_SCAN_RANGES=162.159.192.0/24,162.159.193.0/24,162.159.195.0/24,188.114.96.0/22
-WARP_MAX_LOSS=20
-WARP_MAX_LATENCY=200
+WARP_MAX_LOSS=100
+WARP_MAX_LATENCY=99999
 WARP_LIMIT=20
 
 # 当前已不生效：pre-up 扫描 + 实测，up 后只做持久化，不通才退回逐个实测
@@ -284,6 +284,10 @@ WARP_PREUP_TIMEOUT=60
 # warp=on，且握手时刻有更新。单轮预算要罩住冷握手（3~6 秒）+ TLS + 响应，
 # 低于 6 秒会被自动抬到 6（curl 的连接超时是 5 秒）。
 WARP_PREUP_ROUND_BUDGET=12
+
+# peer 保活间隔（秒）：维持 NAT 的 UDP 映射，冷握手首包不再容易被 NAT 吞掉。
+# pre-up 重建 peer 与写 profile 都会带上；0 = 关闭（沿用 peer 上已有设置）。
+WARP_PERSISTENT_KEEPALIVE=25
 
 # 扫描时强制走物理网络（pre-up 阶段 NM 已装好 WG 策略路由）
 # NM 的规则优先级由连接 UUID 派生，范围 30768~31766，这里必须更小

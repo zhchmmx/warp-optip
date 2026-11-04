@@ -452,8 +452,9 @@ WARP_RESULT_CSV=$STATE_DIR/result.csv
 WARP_SCAN_BIN=$LIBDIR/warp
 
 WARP_SCAN_RANGES=162.159.192.0/24,162.159.193.0/24,162.159.195.0/24,188.114.96.0/22
-WARP_MAX_LOSS=20
-WARP_MAX_LATENCY=200
+# 默认等同关闭：扫描延迟只是初筛参考，真正的判据是 pre-up 冷握手实测
+WARP_MAX_LOSS=100
+WARP_MAX_LATENCY=99999
 WARP_LIMIT=20
 
 WARP_ON_UP_POLICY=keep
@@ -470,6 +471,10 @@ WARP_PREUP_TIMEOUT=60
 # 单轮预算必须罩住一次冷握手（3~6 秒）+ TLS + 响应，别调到 6 以下。
 # 连一个 VPN 都要超过 60 秒的网络，本来就不适合连。
 WARP_PREUP_ROUND_BUDGET=12
+
+# peer 保活间隔（秒）：NAT 的 UDP 映射一超时，冷握手首包就被吞，扫描数字
+# 好看却连不通有这个因素。pre-up 重建 peer 和写 profile 都会带上；0 = 关闭。
+WARP_PERSISTENT_KEEPALIVE=25
 
 # 扫描时强制探测流量走物理网络（pre-up 阶段 NM 已装好 WG 策略路由）
 # NM 的规则优先级由连接 UUID 派生，范围 30768~31766；这里必须比它小
